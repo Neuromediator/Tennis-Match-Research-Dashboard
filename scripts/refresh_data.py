@@ -1,8 +1,18 @@
 """Cold-layer refresh orchestration.
 
-One command, rebuild everything that phase 1 owns:
+One command, refresh everything that phase 1 owns:
 
-    uv run python scripts/refresh_data.py
+    uv run python scripts/refresh_data.py            # incremental
+    uv run python scripts/refresh_data.py --clean    # full rebuild
+
+Default behavior is **incremental**: existing rows are kept and only new
+matches/rankings/aliases are inserted (via ON CONFLICT DO NOTHING).
+Sackmann updates its current-year CSV weekly, tennis-data.co.uk updates
+its xlsx files daily — incremental picks the new data in minutes.
+
+Pass --clean to delete the DuckDB file and rebuild from scratch. Use that
+when the schema changed, or after fixing an ingestion bug whose effect
+needs to be unwound.
 
 Steps:
 1. git submodule update (unless --skip-submodules)
@@ -13,9 +23,7 @@ Steps:
    range (default 2001-current). Failures per-year are logged, not fatal.
 5. Print coverage summary
 
-Every step is idempotent: re-running the script never produces duplicates,
-and individual table state is overwritten only where the underlying
-sources changed.
+Every step is idempotent in either mode.
 """
 
 from __future__ import annotations
@@ -203,6 +211,16 @@ def main() -> int:
         help="Don't download or load tennis-data.co.uk archives",
     )
     parser.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "Delete the DuckDB file before rebuilding (full reset). Use this "
+            "when the schema changes or an ingestion bug needs the data re-derived. "
+            "Default behavior is incremental: existing rows are kept, only new "
+            "ones added via ON CONFLICT DO NOTHING."
+        ),
+    )
+    parser.add_argument(
         "--tours",
         nargs="+",
         choices=["ATP", "WTA"],
@@ -221,6 +239,10 @@ def main() -> int:
     args = parser.parse_args()
 
     print(f"DuckDB target: {config.DUCKDB_PATH}")
+
+    if args.clean and config.DUCKDB_PATH.exists():
+        print(f"--clean: removing {config.DUCKDB_PATH}")
+        config.DUCKDB_PATH.unlink()
 
     if not args.skip_submodules:
         update_submodules()
