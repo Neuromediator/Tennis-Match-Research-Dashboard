@@ -175,7 +175,7 @@ def load_market_file(
     staging: list[dict[str, object]] = []
 
     records: list[dict[str, object]] = df.to_dict(orient="records")  # pyright: ignore[reportAssignmentType]
-    for raw_row in records:
+    for row_idx, raw_row in enumerate(records):
         if "Date" not in raw_row or "Winner" not in raw_row or "Loser" not in raw_row:
             stats.skipped += 1
             continue
@@ -216,6 +216,7 @@ def load_market_file(
         assert loser_lookup.canonical_player_id is not None
         staging.append(
             {
+                "row_idx": row_idx,
                 "date": match_date.date(),
                 "winner_player_id": winner_lookup.canonical_player_id,
                 "loser_player_id": loser_lookup.canonical_player_id,
@@ -239,9 +240,10 @@ def load_market_file(
         _append_rows_csv(unmatched_csv, unmatched_rows)
         return stats
 
-    # Stage 2: one JOIN against matches finds canonical match_ids for the
-    # whole batch. Allow either tier; same date + (winner_id, loser_id)
-    # is specific enough that collisions are vanishingly rare.
+    # Stage 2: JOIN against matches to find a single canonical match_id per
+    # staging row. When both 'main' and 'qual_chall' have a candidate for
+    # the same (winner_id, loser_id, date), prefer 'main' — that's the
+    # tour-level row tennis-data is reporting on.
     staging_df = pd.DataFrame(staging)
     conn.register("market_staging", staging_df)
     try:
@@ -249,7 +251,8 @@ def load_market_file(
             f"""
             SELECT
                 s.*,
-                m.match_id
+                m.match_id,
+                m.match_tier
             FROM market_staging s
             LEFT JOIN matches m
                 ON  m.tour = ?
@@ -257,6 +260,15 @@ def load_market_file(
                 AND m.loser_player_id  = s.loser_player_id
                 AND m.tourney_date BETWEEN s.date - INTERVAL {_DATE_TOLERANCE_DAYS} DAY
                                        AND s.date + INTERVAL {_DATE_TOLERANCE_DAYS} DAY
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY s.row_idx
+                ORDER BY CASE m.match_tier
+                    WHEN 'main' THEN 1
+                    WHEN 'qual_chall' THEN 2
+                    WHEN 'qual_itf' THEN 2
+                    WHEN 'futures' THEN 3
+                    ELSE 4 END NULLS LAST
+            ) = 1
             """,
             [tour],
         ).fetchdf()
