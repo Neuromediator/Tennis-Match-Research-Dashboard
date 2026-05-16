@@ -40,6 +40,11 @@ packages = ["src/tennis_predictor"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = [
+    "data/raw/tennis_atp",
+    "data/raw/tennis_wta",
+    "notebooks",
+]
 
 [tool.ruff.lint]
 select = [
