@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+# (uv.lock IS committed; .venv is not)
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Data — raw and processed live outside version control
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model artifacts (root-level only — src/tennis_predictor/models/ is the Python package)
+/models/
+
+# Notebooks: tracked, but outputs stripped by pre-commit
+# (no ignore needed; nbstripout handles it)
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
