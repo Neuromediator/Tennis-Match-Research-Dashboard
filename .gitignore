@@ -28,11 +28,14 @@ env/
 .env.local
 .env.*.local
 
-# Data — raw and processed live outside version control
+# Data — raw and processed live outside version control,
+# but Sackmann submodules under data/raw/ ARE tracked (as gitlinks).
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+!data/raw/tennis_atp
+!data/raw/tennis_wta
 
 # Model artifacts (root-level only — src/tennis_predictor/models/ is the Python package)
 /models/
