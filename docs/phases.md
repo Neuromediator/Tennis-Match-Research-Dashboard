@@ -4,7 +4,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 0 — Bootstrap (this session)
+## Phase 0 — Bootstrap
 
 **Entry:** empty project directory, agreed scope.
 

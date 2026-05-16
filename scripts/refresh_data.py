@@ -85,13 +85,20 @@ def load_market_for_tour(
         try:
             path = load_market.download_archive(year, tour)
         except urllib.error.HTTPError as e:
-            print(f"  {year}: HTTP {e.code} (likely missing for this tour) - skipping")
+            print(f"  {year}: HTTP {e.code} (missing for this tour) - skipping")
             continue
         except urllib.error.URLError as e:
             print(f"  {year}: network error {e.reason} - skipping")
             continue
+        except ValueError as e:
+            print(f"  {year}: {e} - skipping")
+            continue
 
-        stats = load_market.load_market_file(conn, path, tour, idx)
+        try:
+            stats = load_market.load_market_file(conn, path, tour, idx)
+        except Exception as e:
+            print(f"  {year}: parse failed ({type(e).__name__}: {e}) - skipping")
+            continue
         matched = stats.loaded + stats.review
         total = stats.total()
         rate = matched * 100 / max(total, 1)

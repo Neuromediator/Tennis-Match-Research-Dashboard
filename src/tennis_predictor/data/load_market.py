@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import urllib.request
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -38,6 +39,15 @@ import pandas as pd
 from tennis_predictor import config
 from tennis_predictor.data.ingest_sackmann import Tour, _validate_tour
 from tennis_predictor.data.reconcile import AliasIndex, ReconciliationResult
+
+# tennis-data.co.uk xlsx files carry an "Unknown extension" tag that openpyxl
+# warns about for every sheet. It's harmless and noisy — silence it.
+warnings.filterwarnings(
+    "ignore",
+    message="Unknown extension is not supported and will be removed",
+    category=UserWarning,
+    module="openpyxl",
+)
 
 BASE_URL = "http://www.tennis-data.co.uk"
 
@@ -84,11 +94,18 @@ class LoadStats:
 # Download
 
 
+_XLSX_MAGIC = b"PK\x03\x04"  # All .xlsx files are ZIP archives starting with this
+
+
 def download_archive(year: int, tour: Tour, dest_dir: Path | None = None) -> Path:
     """Download one year's xlsx archive to `dest_dir/{year}.xlsx`.
 
+    Validates that the response is actually a Zip (xlsx) file by checking
+    magic bytes. tennis-data.co.uk uses legacy .xls for some older years and
+    serves it without redirect or 404 — those manifest as a non-zip
+    download. We fail loudly with ValueError so the caller can skip cleanly.
+
     If the file already exists locally it is not re-downloaded. Idempotent.
-    Returns the local path either way.
     """
     _validate_tour(tour)
     if dest_dir is None:
@@ -99,6 +116,14 @@ def download_archive(year: int, tour: Tour, dest_dir: Path | None = None) -> Pat
         return dest
     url = _URL_TEMPLATE[tour].format(base=BASE_URL, year=year)
     urllib.request.urlretrieve(url, dest)
+    with dest.open("rb") as f:
+        magic = f.read(4)
+    if magic != _XLSX_MAGIC:
+        dest.unlink()
+        raise ValueError(
+            f"{url} did not return a valid xlsx (got magic bytes {magic!r}). "
+            "This year may only exist as legacy .xls."
+        )
     return dest
 
 

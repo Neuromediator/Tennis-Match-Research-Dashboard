@@ -13,7 +13,8 @@
       "Bash(git push *)",
       "Bash(git commit *)",
       "Bash(uv pip *)",
-      "Bash(uv add *)"
+      "Bash(uv add *)",
+      "Bash(tee /tmp/refresh_full.log)"
     ]
   },
   "sandbox": {
