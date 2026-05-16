@@ -212,8 +212,28 @@ class AliasIndex:
         if not query:
             return ReconciliationResult(None, 0.0, "unknown", None)
 
-        # extract top-2 so we can detect tight-cluster ambiguity
-        top = process.extract(query, self._choices, scorer=fuzz.WRatio, limit=2)
+        # Fast path: exact normalized match. tennis-data.co.uk uses "Last F."
+        # which after normalization matches our seeded "Last F" form
+        # verbatim — this short-circuits the O(N) fuzzy scan and is by far
+        # the hot path in market-data ingestion.
+        if query in self._canonical_for_norm:
+            return ReconciliationResult(
+                self._canonical_for_norm[query],
+                1.0,
+                "auto",
+                self._raw_for_norm[query],
+                0.0,
+            )
+
+        # Slow path: full rapidfuzz scan. Score cutoff at the review
+        # threshold avoids scoring obviously-bad candidates fully.
+        top = process.extract(
+            query,
+            self._choices,
+            scorer=fuzz.WRatio,
+            limit=2,
+            score_cutoff=REVIEW_THRESHOLD * 100 - 5,
+        )
         if not top:
             return ReconciliationResult(None, 0.0, "unknown", None)
 
