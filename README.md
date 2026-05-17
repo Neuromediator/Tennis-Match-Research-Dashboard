@@ -1,6 +1,8 @@
 # Tennis Match Probability Predictor
 
-A portfolio project: pre-match win-probability predictor for ATP and WTA tour-level singles, with an LLM analyst layer that narrates predictions using tool calling.
+A working tool that gives calibrated win probabilities for upcoming ATP and WTA tour-level singles matches, paired with an LLM analyst that surfaces relevant context (recent news, injuries, form) for each prediction. Built to be useful in real use, not just to illustrate techniques.
+
+**Not a betting tool — we do not claim to beat the market.**
 
 **Status:** Phase 1 (cold data layer) complete — see [docs/phases.md](docs/phases.md). Phase 2 (hot data layer) is next.
 
@@ -37,8 +39,10 @@ After `refresh_data.py`, the DuckDB file lives at `data/processed/tennis.duckdb`
 - ~52,000 market-implied probabilities for 2013-current
 - 75% median match rate vs. tennis-data.co.uk archive
 
-## Why this project
+## What you get
 
-To demonstrate end-to-end ML+LLM engineering: data ingestion, point-in-time-correct feature engineering, walk-forward model evaluation with proper calibration, LLM tool calling with structured outputs, and a deployable interface.
+- A calibrated win probability for any upcoming ATP or WTA tour-level singles match, computed from public match data only.
+- An LLM-written narrative that explains the prediction's `key_factors`, surfaces recent news (withdrawals, injuries, form), and tags the result with a qualitative `confidence_band`. The LLM never overrides the model's number — it contextualizes it.
+- A dashboard showing the model's calibration over time vs. the market's calibration on the same matches — so you can judge how much to trust any individual prediction.
 
-This project does **not** claim to beat the betting market. It is an educational artifact.
+The methodological bar — point-in-time-correct features, walk-forward validation, isotonic/Platt calibration, market-as-benchmark — is set high deliberately: a tool that misleads its users is worse than no tool at all.

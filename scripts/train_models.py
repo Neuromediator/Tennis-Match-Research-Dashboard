@@ -1,4 +1,4 @@
-"""Train the six models (3 types x 2 tours) with walk-forward validation.
+"""Train the four production models (Elo baseline + LightGBM, per tour) with walk-forward validation.
 
 TODO(phase-4): drive the training loop, emit per-model Markdown reports
 to models/<tour>/<model_type>/<timestamp>/.
