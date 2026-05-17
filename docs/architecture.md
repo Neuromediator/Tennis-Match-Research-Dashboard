@@ -28,16 +28,16 @@ A single-process Python application with five logical layers. No microservices. 
            │                                 │
 ┌──────────▼─────────────────────────────────▼──────────────────────┐
 │ Data layer (DuckDB, single file)                                  │
-│   matches, players, rankings, player_aliases,                     │
+│   matches, scheduled_matches, players, rankings, player_aliases,  │
 │   market_implied_probabilities, elo_state, training_features,     │
-│   llm_traces                                                      │
+│   llm_traces, ingestion_runs                                      │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Data sources
 
 - **Cold:** Jeff Sackmann's `tennis_atp` and `tennis_wta` repos as git submodules. Used for both prediction targets (tour-level singles) and feature computation (Challengers/Futures contribute to ratings but not to training labels).
-- **Hot:** a free tennis API (api-tennis.com or alternative; chosen in phase 2) for the last ~30 days of completed matches. Daily refresh.
+- **Hot:** a free tennis API (api-tennis.com or alternative; chosen in phase 2). Three responsibilities: (a) last ~30 days of completed matches appended to `matches`, (b) currently-known upcoming fixtures into `scheduled_matches` — in tennis this is whatever the draw has surfaced so far (full R1 right after a draw, then today/tomorrow's matches as the bracket resolves), this is what the product lets users predict against, (c) inter-week ranking overlay between weekly Sackmann snapshots. Daily refresh logs to `ingestion_runs` so the UI can surface freshness.
 - **Benchmark:** tennis-data.co.uk archives provide closing-price implied probabilities. Loaded into `market_implied_probabilities`. **Not a feature.**
 
 ## Cross-cutting concerns

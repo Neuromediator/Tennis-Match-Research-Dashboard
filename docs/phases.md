@@ -57,15 +57,19 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Entry:** phase 1 exit criteria met.
 
 **Deliverables:**
-- Hot API source chosen and documented (recommended starting point: api-tennis.com).
-- Daily refresh script appending the last ~30 days of completed matches to `matches`.
-- Source-specific player mapping integrated into `player_aliases`.
-- Tests: hot rows do not duplicate cold rows; daily refresh is idempotent.
+- Hot API source chosen and documented (starting point: api-tennis.com; one fallback provider sketched).
+- Daily refresh of **completed matches** for the last ~30 days, appended to `matches`. Tour-level singles only; lower tiers ignored.
+- Daily refresh of **upcoming fixtures** into a new `scheduled_matches` table — players, tournament, surface, scheduled start. The lookahead is whatever the hot API knows at refresh time, which in tennis is naturally short: a tournament draw fixes round 1 at the start of the week (Sun/Mon), and each subsequent round becomes known only once the previous round completes. In practice this means the table holds all of round 1 right after a draw, and rolls down to "today plus part of tomorrow" by mid-tournament. This is what the product lets users predict against; without it the app cannot surface "tonight's matches."
+- Inter-week ranking overlay from the hot source. Sackmann snapshots are weekly; match start times shift mid-week and a stale ranking distorts ranking-delta features. The overlay never overwrites cold snapshots — it sits in front of them at query time.
+- Source-specific player mapping integrated into `player_aliases` (`source='api-tennis'` etc.). Same manual-review checkpoint as cold data — no silent ambiguous merges.
+- **Error budget.** When the hot API is unreachable or partial, the app degrades gracefully: predictions remain available against the last cached fixtures with a visible "data is N hours stale" warning. Every refresh writes a row to a new `ingestion_runs` table (run id, source, started_at, finished_at, rows added/skipped/failed, error if any) so the UI can read the freshness signal.
+- Tests: hot rows do not duplicate cold rows; daily refresh is idempotent; a fixture row promotes to `matches` (with result) when the match completes; ranking overlay never reads from the future.
 
 **Exit:**
-- A "yesterday's matches" command runs and updates DuckDB.
-- Refresh script logs row counts added/skipped.
-- Coverage stays unbroken when switching the active provider (documented fallback).
+- `uv run python scripts/refresh_hot.py` runs end-to-end and updates DuckDB.
+- `scheduled_matches` contains every fixture the hot API knows about at the moment the script runs (in practice: full round 1 right after a draw, or today/tomorrow's matches mid-tournament).
+- `ingestion_runs` records the run with row counts (added / skipped / failed).
+- A simulated API outage (mocked failure) leaves the app usable on the last cache, surfacing the staleness warning.
 
 ---
 
@@ -93,16 +97,19 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Entry:** phase 3 exit criteria met.
 
 **Deliverables:**
-- Six trained models (ATP/WTA × {surface-Elo baseline, logistic, LightGBM}).
+- Two trained models per tour, four artifacts total:
+  - **Surface-Elo baseline** — no learning, pure rating-based prediction. Kept as the honest reference floor: any shipped model must beat this Brier score on walk-forward.
+  - **LightGBM** — gradient-boosted, the production model.
+  - Logistic regression is fine as exploratory work during development but is not a shipped artifact.
 - Walk-forward validation harness with per-fold metrics.
-- Calibration applied per the isotonic/Platt decision rule.
+- Calibration applied per the isotonic/Platt decision rule (`docs/methodology.md`).
 - Per-model artifact directory with `model.joblib`, `metadata.json`, `report.md`, `calibration_plot.png`.
 - Market-benchmark calibration overlay in every report.
 - Round-trip serialization test.
 
 **Exit:**
-- Six fresh model artifacts exist in `models/`.
-- The Brier score of the best ATP model and the best WTA model is reported and recorded.
+- Four fresh model artifacts exist in `models/` (Elo baseline + LightGBM per tour).
+- The LightGBM Brier score beats the Elo baseline on each tour. If it does not, ship the baseline and document the result honestly — the product surfaces the better-calibrated number, not the more complex one.
 - Market-benchmark plot is visible in every report.
 
 ---
@@ -112,14 +119,17 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Entry:** phase 4 exit criteria met.
 
 **Deliverables:**
-- `LLMClient` abstract base with Anthropic implementation; prompt caching enabled.
-- Six tools wired up with Pydantic input/output schemas.
+- `LLMClient` abstract base with Anthropic implementation; prompt caching enabled (system prompt and tool definitions as cacheable blocks).
+- Tools wired up with Pydantic input/output schemas:
+  - `get_model_prediction` — the **only** source of the win probability shown to the user.
+  - `get_player_stats`, `get_head_to_head`, `get_recent_form`, `get_player_ranking` — DuckDB-backed.
+  - `search_tennis_news` — Claude's native `web_search`, first-class tool. For each prediction the agent is expected to query for **withdrawals, injuries, and personal events affecting either player in the last ~14 days**. This is the user-facing differentiator of the product: news the user might otherwise miss.
 - `AgentResponse` Pydantic model (no LLM-emitted probability allowed).
 - `llm_traces` table populated by every call.
-- Tests: tool schemas validate, structured output schema rejects banned fields, end-to-end agent call against a recorded fixture.
+- Tests: tool schemas validate, structured output schema rejects banned fields, end-to-end agent call against a recorded fixture, second invocation shows non-zero cache stats.
 
 **Exit:**
-- A single CLI command runs the agent against a sample query and produces a valid `AgentResponse`.
+- A single CLI command runs the agent against a sample upcoming match and produces a valid `AgentResponse` whose `key_factors` and `caveats` reflect news the tool actually surfaced.
 - `llm_traces` row exists for that call with non-zero cache stats on the second invocation.
 
 ---
@@ -129,13 +139,15 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Entry:** phase 5 exit criteria met.
 
 **Deliverables:**
-- Prediction page: enter two players + tournament + surface + date → display agent response.
-- Dashboard page: per-model calibration plots, headline metrics over time, feature importance (where applicable), recent `llm_traces` browser.
-- Sensible empty / error states.
+- **Home page — upcoming matches.** Sourced from `scheduled_matches`. Grouped by tournament, sorted by scheduled start. Each row links to its prediction page. This is the primary entry point — most users arrive wanting "predict tonight's matches", not "type in two player names."
+- **Prediction page.** Shows: model probability (with the LLM's `confidence_band` as a qualitative tag), `key_factors` and `narrative`, `caveats`, news links surfaced by `search_tennis_news`, and a freshness indicator from `ingestion_runs`.
+- **Custom prediction page (secondary).** Manual player + tournament + surface + date entry, for matches not in `scheduled_matches` or for "what-if" questions.
+- **Dashboard page.** Per-model calibration plots (model vs market overlay), headline metrics over walk-forward folds, recent `llm_traces` browser. This is the "trust" tab — a curious user opens it to see why they should trust the number on the prediction page.
+- Sensible empty / error states. Stale-data warning shown when `ingestion_runs` reports the last successful hot refresh is over 24h old.
 
 **Exit:**
 - `uv run streamlit run src/tennis_predictor/app/main.py` works end to end.
-- Manual smoke test of golden path + at least two edge cases (missing player, no recent matches).
+- Manual smoke test of the golden path (open home → pick a fixture → see prediction + news) and at least two edge cases: a player with no recent matches; hot API marked stale.
 
 ---
 
@@ -144,11 +156,14 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Entry:** phase 6 exit criteria met.
 
 **Deliverables:**
-- Dockerfile producing an image that runs the Streamlit app.
-- Fly.io or Railway deployment configuration committed.
-- README polished: setup, run, deploy, links to docs.
+- Dockerfile producing an image that runs the Streamlit app, with the DuckDB file mounted from a volume.
+- Fly.io or Railway deployment configuration committed (provider chosen by start of this phase).
+- Daily hot refresh runs on a scheduler (Fly cron / Railway cron / GitHub Actions) — not manually.
+- **Cost discipline.** Anthropic API calls are rate-limited per session (or per IP if anonymous). Daily Anthropic-spend cap configured; on overrun the app shows a clean "service unavailable, daily limit reached" state instead of failing requests one by one. The cap is documented in README.
+- README polished: setup, run, deploy, public URL, links to docs.
 - `.env.example` exhaustively updated.
 
 **Exit:**
 - App is reachable at a public URL.
-- A teardown procedure is documented.
+- A teardown procedure is documented (so the project doesn't quietly burn budget after attention shifts).
+- First-load latency on a cold container: a real prediction for an upcoming match renders within a few seconds.

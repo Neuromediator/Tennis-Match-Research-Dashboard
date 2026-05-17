@@ -10,7 +10,7 @@ description: Use when adding a new data source, modifying the DuckDB schema, or 
 | Source | Tier | Phase | Notes |
 |---|---|---|---|
 | Sackmann `tennis_atp` / `tennis_wta` | cold | 1 | Git submodules under `data/raw/`. Pinned commits. |
-| Hot tennis API (api-tennis.com or alternative) | hot | 2 | Last ~30 days of completed matches. Daily refresh. |
+| Hot tennis API (api-tennis.com or alternative) | hot | 2 | Daily refresh, three responsibilities: last ~30 days of completed matches → `matches`; currently-known fixtures → `scheduled_matches` (in tennis the lookahead is naturally short — full R1 right after a draw, then today/tomorrow as the bracket resolves); inter-week ranking overlay on top of weekly Sackmann snapshots. Every run logs to `ingestion_runs`. |
 | tennis-data.co.uk archives | benchmark | 1 | Historical closing-price implied probabilities. **Not a feature source.** |
 
 ## Canonical schema

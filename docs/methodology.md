@@ -1,6 +1,6 @@
 # Methodology — honest evaluation
 
-This project is an educational artifact. We optimize for *trustworthy* probabilistic predictions, not for "look how high our accuracy is."
+This is a product people will actually look at. They'll see "Player A wins with probability 0.62" and form an expectation. We optimize for *trustworthy* probabilistic predictions, not for "look how high our accuracy is." A tool that misleads its users is worse than no tool at all.
 
 ## Why calibration matters more than accuracy
 

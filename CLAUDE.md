@@ -4,7 +4,7 @@ This file is the contract for any Claude session working on this repo. Keep it t
 
 ## Project at a glance
 
-A pre-match win-probability predictor for ATP and WTA tour-level singles, paired with an LLM analyst that explains predictions via tool calling. Educational portfolio project. **We do not claim to beat the betting market.**
+A working tool that gives calibrated win probabilities for upcoming ATP and WTA tour-level singles matches, paired with an LLM analyst that surfaces relevant context (recent news, injuries, form) for each prediction. Built to be useful in real use, not just to illustrate techniques. **Not a betting tool — we do not claim to beat the market.**
 
 Phase tracking lives in `docs/phases.md`. Architecture in `docs/architecture.md`. Evaluation philosophy in `docs/methodology.md`. Read all three before non-trivial work.
 

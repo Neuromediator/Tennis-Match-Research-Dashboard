@@ -7,16 +7,17 @@ description: Use when training a model, modifying validation strategy, choosing 
 
 ## Models trained (v1)
 
-Six total, two per type, one per tour:
+Four total, two per tour:
 
 | Tour | Type | Notes |
 |---|---|---|
-| ATP | Surface-Elo baseline | No learning — pure rating-based prediction. |
-| ATP | Logistic regression | Linear baseline. |
-| ATP | LightGBM | Gradient boosting. |
-| WTA | (same three) | Trained independently. |
+| ATP | Surface-Elo baseline | No learning — pure rating-based prediction. Honest reference floor: a shipped model must beat this. |
+| ATP | LightGBM | Gradient boosting. Production model. |
+| WTA | (same two) | Trained independently. |
 
 ATP and WTA are **never** mixed in training. Surfaces play differently across tours.
+
+Logistic regression is acceptable as exploratory work during development but is not a shipped artifact — two model types per tour are enough to demonstrate that learning beats the baseline (or honestly admit it doesn't, for that tour).
 
 ## Walk-forward validation
 
