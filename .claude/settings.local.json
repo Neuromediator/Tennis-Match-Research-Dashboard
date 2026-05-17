@@ -14,7 +14,9 @@
       "Bash(git commit *)",
       "Bash(uv pip *)",
       "Bash(uv add *)",
-      "Bash(tee /tmp/refresh_full.log)"
+      "Bash(tee /tmp/refresh_full.log)",
+      "Bash(git rm *)",
+      "Bash(git check-ignore *)"
     ]
   },
   "sandbox": {

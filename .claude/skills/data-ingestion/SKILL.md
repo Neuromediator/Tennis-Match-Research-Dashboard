@@ -34,16 +34,27 @@ Players, rankings, aliases, market probabilities, llm_traces, and feature/state 
 
 ## Player reconciliation
 
-Library: `rapidfuzz`. Process:
+Library: `rapidfuzz`. Pipeline (`src/tennis_predictor/data/reconcile.py`):
 
-1. For each new player from a non-canonical source, run `rapidfuzz.process.extractOne` against the canonical roster, **restricted to the same tour**.
-2. Score ≥ 0.90 → write to `player_aliases` automatically.
-3. 0.75 ≤ Score < 0.90 → append to `data/processed/aliases_review.csv` for manual review. The pipeline does **not** auto-merge these.
-4. Score < 0.75 → flag as `unrecognized`; investigate (likely a new young player not in cold source yet).
+1. `seed_aliases_from_players(conn, tour)` seeds three alias forms per canonical Sackmann player: `"First Last"`, `"Last First"`, `"Last F"`. The abbreviated form makes tennis-data.co.uk's `Last F.` format hit the exact-match fast path with no fuzzy cost. Players whose first or last name is `'Unknown'` are excluded.
+2. `AliasIndex.lookup(raw_name)` returns a `ReconciliationResult` with one of three statuses:
+   - **auto** — confidence ≥ 0.90 with no different-canonical-id runner-up within 0.05.
+   - **review** — confidence 0.75-0.90, OR ≥ 0.90 but ambiguous.
+   - **unknown** — confidence < 0.75.
+3. The market-data loader writes `review` outcomes to `data/processed/aliases_review.csv` (full match context, not just the alias). A human reviews them and runs `scripts/apply_aliases_review.py`, which dedupes (raw, tour, canonical_player_id) tuples and INSERTs them into `player_aliases` with `source='manual_review'` and `confidence=1.0`. ON CONFLICT DO NOTHING makes this idempotent.
 
-Same-name players exist (Coria brothers, Pliskova sisters). Auto-match never handles these correctly — that's exactly why the review checkpoint exists.
+Effect: on the next refresh, the same raw names hit the exact-match fast path via the manual_review row and no longer surface in review.
 
-Always normalize unicode (`unicodedata.normalize("NFKD", name)`) and strip diacritics before fuzzy comparison.
+Always normalize unicode (precomposed letters like Đ/Ł/Ø/Æ/Þ/ß require explicit substitution before NFKD — see `_PRECOMPOSED_REPLACEMENTS` in `reconcile.py`).
+
+## Audit artefacts
+
+Each refresh writes two append-only CSVs under `data/processed/`:
+
+- `aliases_review.csv` — fuzzy resolved at low confidence. Workflow above.
+- `unmatched_market_rows.csv` — fuzzy succeeded but the JOIN against `matches` returned zero candidates. Most common cause: same-surname collision in the abbreviated-form seed. Analyzed in `notebooks/explore_unmatched.ipynb`.
+
+Both are append-only across runs — older entries persist so the file doubles as a long-term record of edge cases.
 
 ## DuckDB conventions
 

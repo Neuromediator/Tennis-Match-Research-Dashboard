@@ -43,7 +43,8 @@ A single-process Python application with five logical layers. No microservices. 
 ## Cross-cutting concerns
 
 - **Provenance.** Every match row carries `source` and `match_external_id`.
-- **Player ID reconciliation.** A single canonical `player_id` per player. All non-canonical names map via `player_aliases`. Ambiguous fuzzy matches go to `aliases_review.csv` for manual review.
+- **Player ID reconciliation.** A single canonical `player_id` per player. All non-canonical names map via `player_aliases` (with `source` distinguishing how the alias got there: `sackmann` seeded, `manual_review` approved by a human, hot-API source later). Ambiguous fuzzy matches go to `data/processed/aliases_review.csv` for manual review; `scripts/apply_aliases_review.py` promotes approved decisions back to `player_aliases`.
+- **Audit trail.** Two append-only CSVs under `data/processed/` survive every refresh: `aliases_review.csv` (low-confidence resolutions) and `unmatched_market_rows.csv` (resolved names that didn't join a match row). The first feeds the manual-review loop; the second is a debugging signal explored in `notebooks/explore_unmatched.ipynb`.
 - **Point-in-time correctness.** Enforced by tests, not by convention. The feature layer is the only sanctioned source of feature values.
 - **Observability.** Every LLM call is logged to `llm_traces` with token counts, cache stats, latency, and tool-call sequence.
 - **Configuration.** All paths and env vars flow through `src/tennis_predictor/config.py`. `DATA_DIR` resolves both local dev and containerized deployment.

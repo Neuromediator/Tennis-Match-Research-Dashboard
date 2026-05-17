@@ -36,7 +36,7 @@ CI runs the same four commands. Pre-commit hook runs `ruff` and `nbstripout`.
 4. **The LLM does not emit a probability.** The model's number is the only probability shown. The LLM produces `narrative`, `key_factors`, `confidence_band` (`"low" | "medium" | "high"`), `caveats`. Schema rejects any LLM-supplied probability field.
 5. **Every LLM call is logged.** The `LLMClient` writes a row to `llm_traces` (inputs, tool calls, outputs, tokens, cache stats, latency). No bypass.
 6. **Prompt caching is on by default.** System prompt and tool definitions are sent as cacheable blocks in every call.
-7. **Player reconciliation has a manual-review checkpoint.** Auto-match only at confidence ≥ 0.90. Confidence 0.75–0.90 → `aliases_review.csv` for human review. Never silently merge ambiguous matches.
+7. **Player reconciliation has a manual-review checkpoint.** Auto-match only at confidence ≥ 0.90. Confidence 0.75–0.90 → `data/processed/aliases_review.csv` for human review. Approved entries are promoted to `player_aliases` (with `source='manual_review'`) by `scripts/apply_aliases_review.py`. Never silently merge ambiguous matches.
 8. **Calibration method depends on sample size.** Isotonic when held-out calibration set has ≥ 1000 samples; Platt scaling otherwise.
 9. **No notebook outputs in commits.** `nbstripout` is enforced via pre-commit.
 
@@ -63,6 +63,7 @@ Active model symlinked at `models/<tour>/<model_type>/latest`.
 - **Phased development.** Each phase has entry criteria, deliverables, and exit criteria in `docs/phases.md`. Don't start the next phase until the current phase's exit criteria are green.
 - **Skills.** Domain conventions live in `.claude/skills/<name>/SKILL.md`: `data-ingestion`, `feature-engineering`, `model-training`, `llm-tools`. Read the relevant skill before touching that area.
 - **Chat language.** Responses to the user are in Russian; all code, docs, comments, commit messages are in English.
+- **Cold-layer refresh.** `uv run python scripts/refresh_data.py` is incremental (idempotent). Pass `--clean` to delete the DuckDB file and rebuild from scratch. Audit artefacts live in `data/processed/`: `aliases_review.csv` (low-confidence resolutions awaiting human verdict) and `unmatched_market_rows.csv` (rows tennis-data.co.uk reported but we couldn't join — analyzed in `notebooks/explore_unmatched.ipynb`).
 
 ## What to avoid
 -  Never read `.env`. It contains live API keys. Reading it exposes the values in this conversation's transcript. If you need to know which api keys are inside this file, ask user about it.
