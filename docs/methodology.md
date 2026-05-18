@@ -55,9 +55,24 @@ Point-in-time correctness is enforced by tests in `tests/test_feature_leakage.py
 
 A failing leakage test is never "fixed" by adjusting the test. The bug is in the feature.
 
+## Why predictions are tour-level only (and feature computation is not)
+
+The product predicts only **ATP/WTA tour-level singles** matches — Grand Slams, ATP/WTA 1000/500/250, and the year-end Finals. Challenger and ITF Futures matches are present in our data sources and **do** feed the feature layer (Elo ratings, recent form, fatigue) — players move between tiers, and ratings computed across the full pool are sharper than ratings computed on tour-only history. We just don't surface predictions for those tiers in the UI.
+
+Three reasons the prediction surface stops at tour-level:
+
+1. **No market benchmark exists below tour-level.** tennis-data.co.uk closing prices and matchstat's `tournament/results` odds are tour-level only. Without them we can compute our Brier score on Challenger / ITF predictions, but we cannot say what it *means*. The headline narrative "our calibration is approaching the market's" — the only honest framing we have — collapses. We'd be left with "trust this number," which is exactly what this document rejects.
+
+2. **The LLM analyst has nothing to surface.** `search_tennis_news` against an M15 Futures match returns essentially zero results — there is no media coverage of injuries, withdrawals, or personal events at that level. The contextualization layer — the product's user-facing differentiator — has no signal to work with. A prediction with no `key_factors` and no `caveats` is just a number, which we explicitly do not ship.
+
+3. **Data quality degrades at lower tiers.** Higher rates of retirements and walkovers, more debutants with sparse histories, and reduced data discipline (the matchstat probe surfaced "Unknown Player" placeholders for older lower-tier records). Recent-form windows become noisier; feature variance rises faster than feature signal.
+
+The first two points are the binding constraints; the third is a contributing one. If a future Challenger-level odds source appeared, point 1 would relax for that tier — but point 2 would still keep us from a useful product surface there.
+
 ## What we do not claim
 
 - We do not claim to beat the market.
 - We do not claim our LLM can predict outcomes the model cannot.
 - We do not claim the model is suitable for betting. It is not.
 - We do not claim coverage of every tour-level match — feature availability depends on data sources, and matches with insufficient history are deliberately excluded from training.
+- We do not claim coverage of Challenger or ITF matches. See [Why predictions are tour-level only](#why-predictions-are-tour-level-only-and-feature-computation-is-not).
