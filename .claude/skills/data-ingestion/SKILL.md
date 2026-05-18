@@ -10,14 +10,14 @@ description: Use when adding a new data source, modifying the DuckDB schema, or 
 | Source | Tier | Phase | Notes |
 |---|---|---|---|
 | Sackmann `tennis_atp` / `tennis_wta` | cold | 1 | Git submodules under `data/raw/`. Pinned commits. |
-| Hot tennis API (api-tennis.com or alternative) | hot | 2 | Daily refresh, three responsibilities: last ~30 days of completed matches → `matches`; currently-known fixtures → `scheduled_matches` (in tennis the lookahead is naturally short — full R1 right after a draw, then today/tomorrow as the bracket resolves); inter-week ranking overlay on top of weekly Sackmann snapshots. Every run logs to `ingestion_runs`. |
+| matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI) | hot | 2 | Free tier: 500 req/month, hard cap — refresh script must budget tightly (no naive retry loops, request count logged to `ingestion_runs`). Daily responsibilities: last ~30 days of completed matches → `matches`; currently-known fixtures → `scheduled_matches` (lookahead is naturally short — full R1 right after a draw, then today/tomorrow as the bracket resolves); inter-week ranking overlay on top of weekly Sackmann snapshots. |
 | tennis-data.co.uk archives | benchmark | 1 | Historical closing-price implied probabilities. **Not a feature source.** |
 
 ## Canonical schema
 
 The `matches` table holds rows from every source, distinguished by:
 
-- `source` — one of `"sackmann"`, `"api-tennis"`, `"tennis-data-co-uk"`, ...
+- `source` — one of `"sackmann"`, `"matchstat"`, `"tennis-data-co-uk"`, ...
 - `match_external_id` — the source's own identifier; `(source, match_external_id)` is unique.
 - `tour` — `"ATP"` or `"WTA"`.
 - `match_date`, `tournament_name`, `tournament_level`, `surface`, `round`, `best_of`.
