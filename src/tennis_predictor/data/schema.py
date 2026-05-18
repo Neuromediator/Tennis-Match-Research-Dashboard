@@ -158,6 +158,65 @@ CREATE TABLE IF NOT EXISTS elo_state (
 );
 """
 
+# Upcoming fixtures pulled from the hot API. One row per fixture the API
+# currently exposes (round-by-round visibility — see docs/phases.md Phase 2).
+# Rows are removed (or matched out) once the corresponding `matches` row
+# appears with a result. Linkage to `matches` is the composite
+# (tournament_external_id, player1_external_id, player2_external_id,
+# round_external_id) — NOT a shared external id.
+SCHEDULED_MATCHES_DDL = """
+CREATE TABLE IF NOT EXISTS scheduled_matches (
+    scheduled_match_id        VARCHAR PRIMARY KEY,
+    source                    VARCHAR NOT NULL,
+    fixture_external_id       VARCHAR NOT NULL,
+
+    tour                      VARCHAR NOT NULL,
+    tournament_external_id    VARCHAR NOT NULL,
+    tournament_name           VARCHAR,
+    tournament_tier           VARCHAR,
+    tournament_country_acr    VARCHAR,
+    surface                   VARCHAR,
+    round_external_id         VARCHAR,
+    round_name                VARCHAR,
+
+    player1_external_id       VARCHAR NOT NULL,
+    player2_external_id       VARCHAR NOT NULL,
+    player1_canonical_id      VARCHAR,
+    player2_canonical_id      VARCHAR,
+    player1_name              VARCHAR NOT NULL,
+    player2_name              VARCHAR NOT NULL,
+    player1_country_acr       VARCHAR,
+    player2_country_acr       VARCHAR,
+    player1_seed              VARCHAR,
+    player2_seed              VARCHAR,
+
+    scheduled_start_utc       TIMESTAMP,
+    ingested_at               TIMESTAMP NOT NULL,
+
+    UNIQUE (source, fixture_external_id)
+);
+"""
+
+# One row per refresh execution against any source. Drives the
+# "data is N hours stale" warning in the UI and tracks per-source
+# request usage against quota caps.
+INGESTION_RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    run_id          VARCHAR PRIMARY KEY,
+    source          VARCHAR NOT NULL,
+    tour            VARCHAR,
+    started_at      TIMESTAMP NOT NULL,
+    finished_at     TIMESTAMP,
+    status          VARCHAR NOT NULL,
+    rows_added      INTEGER,
+    rows_skipped    INTEGER,
+    rows_failed     INTEGER,
+    requests_used   INTEGER,
+    error_message   VARCHAR,
+    notes           VARCHAR
+);
+"""
+
 # TODO(phase-3): feature columns are designed in phase 3. This placeholder
 # exists so the schema check passes and the table name is reserved. Phase 3
 # will likely DROP + CREATE this table with the full FeatureVector layout
@@ -180,6 +239,13 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_players_tour ON players(tour);",
     "CREATE INDEX IF NOT EXISTS idx_rankings_player_date ON rankings(player_id, ranking_date);",
     "CREATE INDEX IF NOT EXISTS idx_llm_traces_ts ON llm_traces(ts);",
+    "CREATE INDEX IF NOT EXISTS idx_scheduled_matches_start "
+    "ON scheduled_matches(scheduled_start_utc);",
+    "CREATE INDEX IF NOT EXISTS idx_scheduled_matches_composite "
+    "ON scheduled_matches(tournament_external_id, player1_external_id, "
+    "player2_external_id, round_external_id);",
+    "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source_started "
+    "ON ingestion_runs(source, started_at);",
 ]
 
 TABLE_DDL: list[str] = [
@@ -192,6 +258,8 @@ TABLE_DDL: list[str] = [
     LLM_TRACES_DDL,
     ELO_STATE_DDL,
     TRAINING_FEATURES_DDL,
+    SCHEDULED_MATCHES_DDL,
+    INGESTION_RUNS_DDL,
 ]
 
 EXPECTED_TABLES: frozenset[str] = frozenset(
@@ -204,6 +272,8 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "llm_traces",
         "elo_state",
         "training_features",
+        "scheduled_matches",
+        "ingestion_runs",
     }
 )
 

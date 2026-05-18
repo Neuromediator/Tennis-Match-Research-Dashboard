@@ -80,3 +80,73 @@ def test_llm_traces_autoincrements_trace_id(fresh_db: duckdb.DuckDBPyConnection)
     ids = [row[0] for row in fresh_db.execute("SELECT trace_id FROM llm_traces").fetchall()]
     assert len(ids) == 2
     assert ids[0] != ids[1]
+
+
+def test_scheduled_matches_accepts_well_formed_row(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    schema.create_all_tables(fresh_db)
+    fresh_db.execute(
+        """
+        INSERT INTO scheduled_matches (
+            scheduled_match_id, source, fixture_external_id,
+            tour, tournament_external_id, tournament_name, tournament_tier,
+            surface, round_external_id, round_name,
+            player1_external_id, player2_external_id,
+            player1_name, player2_name,
+            scheduled_start_utc, ingested_at
+        ) VALUES (
+            'matchstat::1215', 'matchstat', '1215',
+            'ATP', '21327', 'Geneva Open', 'ATP 250',
+            'Clay', '4', 'R32',
+            '37741', '87277',
+            'Zizou Bergs', 'Arthur Gea',
+            TIMESTAMP '2026-05-19 13:00:00', CURRENT_TIMESTAMP
+        )
+        """
+    )
+    count = fresh_db.execute("SELECT COUNT(*) FROM scheduled_matches").fetchone()
+    assert count is not None and count[0] == 1
+
+
+def test_scheduled_matches_rejects_duplicate_external_id(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """The UNIQUE (source, fixture_external_id) constraint is what makes daily
+    refresh idempotent — re-running must not produce duplicates."""
+    schema.create_all_tables(fresh_db)
+    base_sql = """
+        INSERT INTO scheduled_matches (
+            scheduled_match_id, source, fixture_external_id,
+            tour, tournament_external_id,
+            player1_external_id, player2_external_id,
+            player1_name, player2_name,
+            ingested_at
+        ) VALUES (?, 'matchstat', '1215', 'ATP', '21327',
+                  '37741', '87277', 'Zizou Bergs', 'Arthur Gea', CURRENT_TIMESTAMP)
+    """
+    fresh_db.execute(base_sql, ["matchstat::1215"])
+    with pytest.raises(duckdb.ConstraintException):
+        fresh_db.execute(base_sql, ["matchstat::1215-dup"])
+
+
+def test_ingestion_runs_accepts_well_formed_row(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    schema.create_all_tables(fresh_db)
+    fresh_db.execute(
+        """
+        INSERT INTO ingestion_runs (
+            run_id, source, tour, started_at, finished_at, status,
+            rows_added, rows_skipped, rows_failed, requests_used
+        ) VALUES (
+            'run-abc-123', 'matchstat', 'ATP',
+            TIMESTAMP '2026-05-18 06:00:00', TIMESTAMP '2026-05-18 06:00:12',
+            'success', 42, 3, 0, 7
+        )
+        """
+    )
+    row = fresh_db.execute(
+        "SELECT status, rows_added, requests_used FROM ingestion_runs WHERE run_id = 'run-abc-123'"
+    ).fetchone()
+    assert row == ("success", 42, 7)
