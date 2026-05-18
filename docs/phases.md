@@ -57,13 +57,35 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Entry:** phase 1 exit criteria met.
 
 **Deliverables:**
-- Hot API source: **matchstat Tennis API** (published as "Tennis API - ATP WTA ITF" on RapidAPI; reference docs at `tennisapidoc.matchstat.com`). Free tier: 500 requests / month, hard cap. This drives the daily-refresh budget — the refresh script must be parsimonious (no naive retry loops, request-per-call accounting logged to `ingestion_runs`). At ~6–10 calls per typical day plus a ~90-call one-off bootstrap, 500/month leaves modest but real headroom; sustained dev/exploration should hit a separate dev key. If matchstat is retired or its free tier shrinks, the documented fallback is any RapidAPI tennis API exposing fixtures-by-date, results-by-date, and ATP/WTA rankings on a free tier ≥ 1500 req/month.
-- Daily refresh of **completed matches** for the last ~30 days, appended to `matches`. Tour-level singles only; lower tiers ignored.
-- Daily refresh of **upcoming fixtures** into a new `scheduled_matches` table — players, tournament, surface, scheduled start. The lookahead is whatever the hot API knows at refresh time, which in tennis is naturally short: a tournament draw fixes round 1 at the start of the week (Sun/Mon), and each subsequent round becomes known only once the previous round completes. In practice this means the table holds all of round 1 right after a draw, and rolls down to "today plus part of tomorrow" by mid-tournament. This is what the product lets users predict against; without it the app cannot surface "tonight's matches."
-- Inter-week ranking overlay from the hot source. Sackmann snapshots are weekly; match start times shift mid-week and a stale ranking distorts ranking-delta features. The overlay never overwrites cold snapshots — it sits in front of them at query time.
-- Source-specific player mapping integrated into `player_aliases` (`source='matchstat'`). Same manual-review checkpoint as cold data — no silent ambiguous merges.
-- **Error budget.** When the hot API is unreachable or partial, the app degrades gracefully: predictions remain available against the last cached fixtures with a visible "data is N hours stale" warning. Every refresh writes a row to a new `ingestion_runs` table (run id, source, started_at, finished_at, rows added/skipped/failed, error if any) so the UI can read the freshness signal.
-- Tests: hot rows do not duplicate cold rows; daily refresh is idempotent; a fixture row promotes to `matches` (with result) when the match completes; ranking overlay never reads from the future.
+
+- **Hot API provider: matchstat Tennis API.** Published as "Tennis API - ATP WTA ITF" on RapidAPI; reference docs at `tennisapidoc.matchstat.com`. Free tier: 500 requests / month, hard cap. Documented fallback if matchstat is retired or its free tier shrinks: any RapidAPI tennis API exposing fixtures-by-date, completed matches with scores, and ATP/WTA rankings on a free tier ≥ 1500 req/month.
+
+- **Endpoint-to-responsibility map** (all under `https://tennis-api-atp-wta-itf.p.rapidapi.com/tennis/v2`):
+
+  | Endpoint | Purpose | Frequency |
+  |---|---|---|
+  | `/{tour}/tournament/calendar/{year}` | Season inventory — drives the active-tournament filter via the `tier` field. | Weekly per tour, cached. |
+  | `/{tour}/fixtures/{date}?include=tournament.court,tournament.rank,round&filter=PlayerGroup:singles` | Upcoming fixtures → `scheduled_matches`. `include` brings surface (`court.name`) and round name; `filter` drops doubles. | Daily per tour. |
+  | `/{tour}/tournament/results/{seasonid}` | Completed matches + scores → `matches`. Pre-match odds (`odd1`/`odd2`) → `market_implied_probabilities`. | Daily per active tour-level event. |
+  | `/{tour}/ranking/singles?pageSize=100` | Inter-week ranking overlay between weekly Sackmann snapshots. | Daily per tour. |
+
+  Tour-level whitelist on `tier`: `{"Grand Slam", "ATP 1000", "ATP 500", "ATP 250", "WTA 1000", "WTA 500", "WTA 250", "Finals"}`. Everything else (Challengers, ITF tiers like `"M15"`, `"M25"`) is dropped.
+
+- **Budget.** Typical day: ~7–10 calls. Slam weeks: ~12–15. Bootstrap (back-fill the last ~30 days of completed results across ~20–30 recently-finished tour-level events): ~50 calls, one-off. Steady-state monthly: ~250–350 against the 500/month cap. Refresh script must avoid naive retry loops; per-call counts logged to `ingestion_runs`.
+
+- **Upcoming fixtures lookahead is naturally short.** Tennis draws fix round 1 at the start of the week (Sun/Mon), and each subsequent round becomes known only once the previous round completes. The `scheduled_matches` table reflects whatever the API knows at refresh time: full round 1 right after a draw, rolling down to "today plus part of tomorrow" by mid-tournament. This is what the product lets users predict against; without it the app cannot surface "tonight's matches."
+
+- **Cross-source key.** Fixture `id` from `/fixtures/...` (small integer) and match `id` from `/tournament/results/...` (8-digit string) are **not** the same identifier. The link between a `scheduled_matches` row and the `matches` row produced when the match completes is the composite `(tournamentId, player1Id, player2Id, roundId)`, not a shared external id.
+
+- **Pre-match odds bonus.** `odd1`/`odd2` from `tournament/results` feed `market_implied_probabilities` for current events after overround normalization — the same pipeline as the cold tennis-data.co.uk loader. This removes the need to scrape tennis-data.co.uk for the trailing market window.
+
+- **New tables.** `scheduled_matches` (upcoming fixtures) and `ingestion_runs` (one row per refresh: run id, source, started_at, finished_at, rows added/skipped/failed, error if any) — the UI reads the freshness signal from `ingestion_runs`.
+
+- **Source-specific player mapping** integrated into `player_aliases` (`source='matchstat'`). Same manual-review checkpoint as cold data — no silent ambiguous merges.
+
+- **Error budget.** When the hot API is unreachable or partial, the app degrades gracefully: predictions remain available against the last cached fixtures with a visible "data is N hours stale" warning, sourced from `ingestion_runs`.
+
+- **Tests.** Hot rows do not duplicate cold rows; daily refresh is idempotent; a fixture row promotes to a `matches` row (with result) when the match completes (composite-key match); ranking overlay never reads from the future; the tier-whitelist filter drops Challenger/ITF rows.
 
 **Exit:**
 - `uv run python scripts/refresh_hot.py` runs end-to-end and updates DuckDB.

@@ -10,8 +10,30 @@ description: Use when adding a new data source, modifying the DuckDB schema, or 
 | Source | Tier | Phase | Notes |
 |---|---|---|---|
 | Sackmann `tennis_atp` / `tennis_wta` | cold | 1 | Git submodules under `data/raw/`. Pinned commits. |
-| matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI) | hot | 2 | Free tier: 500 req/month, hard cap — refresh script must budget tightly (no naive retry loops, request count logged to `ingestion_runs`). Daily responsibilities: last ~30 days of completed matches → `matches`; currently-known fixtures → `scheduled_matches` (lookahead is naturally short — full R1 right after a draw, then today/tomorrow as the bracket resolves); inter-week ranking overlay on top of weekly Sackmann snapshots. |
+| matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI) | hot | 2 | Free tier: 500 req/month, hard cap. Daily responsibilities: completed matches + scores → `matches`; currently-known fixtures → `scheduled_matches`; inter-week ranking overlay; pre-match odds → `market_implied_probabilities`. See **matchstat endpoint contracts** below. |
 | tennis-data.co.uk archives | benchmark | 1 | Historical closing-price implied probabilities. **Not a feature source.** |
+
+## matchstat endpoint contracts (hot ingestion)
+
+Base URL: `https://tennis-api-atp-wta-itf.p.rapidapi.com/tennis/v2`. Path placeholder `{tour}` resolves to `atp` or `wta`. Auth: header `X-RapidAPI-Key` from `X_RAPIDAPI_KEY` env-var; header `X-RapidAPI-Host` = `tennis-api-atp-wta-itf.p.rapidapi.com`.
+
+| Endpoint | Drives | Notes |
+|---|---|---|
+| `/{tour}/tournament/calendar/{year}` | Active-tournament inventory; cached weekly. | Items have `id` (seasonid), `name`, `tier`, `court.name` (surface), `date` (start). The `tier` field is the canonical level filter. |
+| `/{tour}/fixtures/{date}` | `scheduled_matches` insertions. | **Always pass** `include=tournament.court,tournament.rank,round` (otherwise no surface or round name) and `filter=PlayerGroup:singles` (otherwise doubles teams come through as composite-name "players"). |
+| `/{tour}/tournament/results/{seasonid}` | `matches` insertions + `market_implied_probabilities` from `odd1`/`odd2`. | Returns four arrays: `singles`, `doubles`, `qualifying`, `doublesQualifying`. Consume `singles` only. Each item carries `match_winner` (player id), `result` (score string, e.g. `"6-4 6-4"`), `odd1`/`odd2`. |
+| `/{tour}/ranking/singles?pageSize=100` | Inter-week ranking overlay. | One page of 100 normally covers all we care about; `hasNextPage` flag indicates more. |
+
+**Tour-level filter.** Apply `tier in {"Grand Slam", "ATP 1000", "ATP 500", "ATP 250", "WTA 1000", "WTA 500", "WTA 250", "Finals"}` from the calendar response. Drop everything else — Challengers and ITF Futures (`"M15"`, `"M25"`, etc.) are not in our scope.
+
+**Cross-source key.** `/fixtures/...` returns `id` as a small integer (fixture-row id); `/tournament/results/...` returns `id` as an 8-digit string (match-record id). These are **different identifiers**. The link between a `scheduled_matches` row and the `matches` row produced when the match completes is the composite `(tournamentId, player1Id, player2Id, roundId)`.
+
+**Defensive parsing.**
+- The calendar payload has a typo `coutry` (missing the `n`) for the country field. Resolve via `r.get("country") or r.get("coutry")`.
+- `date` can be `null` in fixtures for not-yet-scheduled matches (most often today's items where time-of-day isn't fixed yet). Not an error; row still has tournament/round/player context.
+- `tournament.rank` may be `null` for non-tour events — secondary fallback for the tier filter when `tier` is missing.
+
+**Quota discipline.** Per-call counts logged to `ingestion_runs`. No naive retry loops. Bootstrap (~50 calls) is one-off; steady-state ~7–10/day (~12–15 in Slam weeks).
 
 ## Canonical schema
 
