@@ -227,11 +227,7 @@ class MatchstatClient:
             timeout=timeout,
         )
         self._owns_client = client is None
-        self._requests_used = 0
-
-    @property
-    def requests_used(self) -> int:
-        return self._requests_used
+        self.requests_used: int = 0
 
     def close(self) -> None:
         if self._owns_client:
@@ -244,7 +240,7 @@ class MatchstatClient:
         self.close()
 
     def _get_json(self, path: str, params: dict[str, str] | None = None) -> Any:
-        self._requests_used += 1
+        self.requests_used += 1
         response = self._client.get(path, params=params)
         if response.status_code != 200:
             raise MatchstatError(response.status_code, response.text, str(response.url))
