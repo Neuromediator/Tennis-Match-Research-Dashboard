@@ -2330,6 +2330,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "duckdb" },
+    { name = "httpx" },
     { name = "lightgbm" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -2358,6 +2359,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40.0" },
     { name = "duckdb", specifier = ">=1.1.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "lightgbm", specifier = ">=4.5.0" },
     { name = "matplotlib", specifier = ">=3.9.0" },
     { name = "numpy", specifier = ">=2.0.0" },
