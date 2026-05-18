@@ -50,6 +50,9 @@ data/processed/*
 *.swo
 .DS_Store
 
+# Claude Code — per-machine permission state, not shared
+.claude/settings.local.json
+
 # Personal study materials — kept locally, not part of the public repo
 docs/tutorials/
 tennis_predictor_bootstrap_prompt.md
