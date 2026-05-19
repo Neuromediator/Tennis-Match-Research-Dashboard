@@ -101,8 +101,8 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 **Deliverables:**
 - `build_training_features()` producing `training_features` rows for every eligible match.
 - `compute_features(...) -> FeatureVector` for inference.
-- Pydantic `FeatureVector` schema.
-- Surface-Elo ratings pipeline with persistent `elo_state`.
+- Pydantic `FeatureVector` schema — **28 fields in v1** (26 numeric + 2 categorical) across seven families: Surface-Elo, recent form, serve/return rolling, H2H, fatigue, ranking, tournament context. Exact field-by-field list and the rationale for the non-obvious serve/return choices (why `first_serve_win_pct` over `first_serve_in_pct`, why `aces_per_game` and `double_faults_per_game` are excluded in v1, etc.) live in `.claude/skills/feature-engineering/SKILL.md`.
+- Surface-Elo ratings pipeline with persistent `elo_state` — default rating 1500, K-factor 32, one row per `(player, surface)` pair.
 - Rolling, H2H, fatigue, and ranking features.
 - Leakage tests: tampered-future-rows fixtures, asserting no past feature value moves.
 
