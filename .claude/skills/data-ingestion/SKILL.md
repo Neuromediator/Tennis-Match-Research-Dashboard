@@ -10,7 +10,7 @@ description: Use when adding a new data source, modifying the DuckDB schema, or 
 | Source | Tier | Phase | Notes |
 |---|---|---|---|
 | Sackmann `tennis_atp` / `tennis_wta` | cold | 1 | Git submodules under `data/raw/`. Pinned commits. |
-| matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI) | hot | 2 | Free tier: 500 req/month, hard cap. Daily responsibilities: completed matches + scores → `matches`; currently-known fixtures → `scheduled_matches`; inter-week ranking overlay; pre-match odds → `market_implied_probabilities`. See **matchstat endpoint contracts** below. |
+| matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI) | hot | 2 | Free tier: 500 req/month, hard cap. Daily responsibilities under Path C (chosen at Phase 2 close): currently-known fixtures → `scheduled_matches`; inter-week ranking overlay; tier-by-tournament-id metadata via calendar. **Completed matches do NOT come from matchstat** — its calendar/{year} is forward-only and drops in-progress events, so Sackmann (cold) is the source of truth for finished matches. See **matchstat endpoint contracts** below. |
 | tennis-data.co.uk archives | benchmark | 1 | Historical closing-price implied probabilities. **Not a feature source.** |
 
 ## matchstat endpoint contracts (hot ingestion)
@@ -19,12 +19,12 @@ Base URL: `https://tennis-api-atp-wta-itf.p.rapidapi.com/tennis/v2`. Path placeh
 
 | Endpoint | Drives | Notes |
 |---|---|---|
-| `/{tour}/tournament/calendar/{year}` | Active-tournament inventory; cached weekly. | Items have `id` (seasonid), `name`, `tier`, `court.name` (surface), `date` (start). The `tier` field is the canonical level filter. |
+| `/{tour}/tournament/calendar/{year}` | Tier-by-tournament-id lookup for `scheduled_matches.tournament_tier`. | One call/day per tour. Items have `id` (seasonid), `name`, `tier`, `court.name`, `date`. Forward-only — currently-active tournaments may be absent; affected fixture rows get `tournament_tier=NULL`. |
 | `/{tour}/fixtures/{date}` | `scheduled_matches` insertions. | **Always pass** `include=tournament.court,tournament.rank,round` (otherwise no surface or round name) and `filter=PlayerGroup:singles` (otherwise doubles teams come through as composite-name "players"). |
-| `/{tour}/tournament/results/{seasonid}` | `matches` insertions + `market_implied_probabilities` from `odd1`/`odd2`. | Returns four arrays: `singles`, `doubles`, `qualifying`, `doublesQualifying`. Consume `singles` only. Each item carries `match_winner` (player id), `result` (score string, e.g. `"6-4 6-4"`), `odd1`/`odd2`. |
 | `/{tour}/ranking/singles?pageSize=100` | Inter-week ranking overlay. | One page of 100 normally covers all we care about; `hasNextPage` flag indicates more. |
+| `/{tour}/tournament/results/{seasonid}` | **Not used in steady state** (Path C). Kept available — code paths in `load_hot.insert_completed_matches` and `insert_market_odds_from_matches` are tested, dormant. Re-wire if Path B (discover seasonid from fixtures) is later adopted. | Returns four arrays: `singles`, `doubles`, `qualifying`, `doublesQualifying`. `singles` items carry `match_winner`, `result` (e.g. `"6-4 6-4"`), `odd1`/`odd2`. |
 
-**Tour-level filter.** Apply `tier in {"Grand Slam", "ATP 1000", "ATP 500", "ATP 250", "WTA 1000", "WTA 500", "WTA 250", "Finals"}` from the calendar response. Drop everything else — Challengers and ITF Futures (`"M15"`, `"M25"`, etc.) are not in our scope.
+**Tour-level filter.** Apply `tier in {"Grand Slam", "ATP Masters 1000", "ATP 500", "ATP 250", "WTA Masters 1000", "WTA 1000", "WTA 500", "WTA 250", "Finals"}` from the calendar response. Strings are the literal matchstat values — Masters uses `"ATP Masters 1000"`, not bare `"ATP 1000"` (observed via live API at Phase 2 close). Drop everything else — Challengers and ITF Futures (`"Future"`, `"M15"`, `"M25"`, etc.) are not in our scope.
 
 **Cross-source key.** `/fixtures/...` returns `id` as a small integer (fixture-row id); `/tournament/results/...` returns `id` as an 8-digit string (match-record id). These are **different identifiers**. The link between a `scheduled_matches` row and the `matches` row produced when the match completes is the composite `(tournamentId, player1Id, player2Id, roundId)`.
 

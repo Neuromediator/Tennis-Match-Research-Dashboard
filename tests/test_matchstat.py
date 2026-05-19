@@ -283,12 +283,21 @@ def test_non_200_raises_matchstat_error() -> None:
 
 
 def test_tour_level_tiers_contains_expected_values() -> None:
-    """Schema-time contract for the tier whitelist."""
+    """Schema-time contract for the tier whitelist.
+
+    The strings here are the literal `tier` values matchstat returns on the
+    /tournament/calendar/{year} endpoint — observed via the live API. The
+    smoke test on 2026-05-19 surfaced that matchstat writes
+    `"ATP Masters 1000"` for ATP Masters events, NOT `"ATP 1000"` —
+    initial implementation guessed the latter and dropped Masters from
+    the active-tournament filter as a result.
+    """
     expected = {
         "Grand Slam",
-        "ATP 1000",
+        "ATP Masters 1000",
         "ATP 500",
         "ATP 250",
+        "WTA Masters 1000",
         "WTA 1000",
         "WTA 500",
         "WTA 250",

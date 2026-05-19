@@ -1,22 +1,34 @@
 """Daily hot-data refresh orchestrator (Phase 2).
 
 Composes the API client, the resolver, and the load layer into one
-end-to-end run:
+end-to-end run. Per the Phase 2 close-out decision (Path C, documented
+in `docs/tutorials/phase_2.md` and `docs/phases.md`), the orchestrator
+pulls only **fixtures** and **rankings** from matchstat; completed
+matches are sourced from the cold Sackmann layer (weekly git submodule)
+because matchstat's `calendar/{year}` is forward-only and silently
+drops currently-active tournaments, which makes the calendar-driven
+results path unreliable.
 
+Steps:
 1. Open an `ingestion_runs` row with `status='running'`.
 2. For each tour:
-   a. Fetch the year's calendar; keep tour-level tournaments that are
-      "recently active" (start_date <= today <= start_date + 21d).
-   b. For each active tournament: fetch `tournament/results/{seasonid}`,
-      insert singles + qualifying matches and pre-match odds.
-   c. Fetch `fixtures/{today}` (and `{tomorrow}`, paginated to cover all
-      currently-known draws), insert into `scheduled_matches`.
-   d. Fetch current rankings, write overlay.
-3. Promote any `scheduled_matches` row whose composite key now appears
-   in `matches` (i.e., the fixture has completed).
+   a. Fetch the year's calendar — used **only** to build a
+      `{tournament_id: tier}` lookup so `scheduled_matches.tournament_tier`
+      can be populated. tournament/results is NOT called.
+   b. Fetch `fixtures/{today}` (and `{tomorrow}`, paginated), insert into
+      `scheduled_matches`.
+   c. Fetch current rankings, write overlay.
+3. Run `promote_completed_fixtures()` — currently a near-no-op under
+   Path C (Sackmann tourney_id won't match matchstat tournament_id), but
+   kept so the path is wired if Path B ever ships.
 4. Write the resolver's `review_buffer` to `aliases_review_matchstat.csv`.
 5. Close the `ingestion_runs` row with `status='success' | 'partial' |
    'failed'`, totals, `requests_used`.
+
+The `_refresh_tournament_results` helper, `insert_completed_matches`,
+`insert_market_odds_from_matches`, and `MatchstatClient.tournament_results`
+remain in the codebase: they're tested and harmless when not called.
+A future Path B (discover seasonids from fixtures) would rewire them.
 
 Functions in this module take an injected `client` so unit tests can pass
 a fake; only `scripts/refresh_hot.py` wires the real `MatchstatClient`.
@@ -295,15 +307,19 @@ def refresh_hot(
             summary = TourSummary(tour=tour)
             per_tour[tour] = summary
 
+            # Calendar is used only for tier metadata (Path C). It's
+            # forward-only — currently-active tournaments may be absent,
+            # in which case fixtures for those tournaments get
+            # tournament_tier=NULL (the UI handles this).
             calendar = client.calendar(tour_code, today.year)
-            active = [
-                t
-                for t in calendar
-                if (t.tier in TOUR_LEVEL_TIERS and _is_recently_active(t, today))
-            ]
-            tier_by_id = {t.id: t.tier for t in active}
+            tier_by_id: dict[int, str | None] = {
+                t.id: t.tier for t in calendar if t.tier in TOUR_LEVEL_TIERS
+            }
 
-            _refresh_tournament_results(conn, client, tour_code, tour, active, resolver, summary)
+            # Path C: do NOT fetch tournament/results — completed matches
+            # come from Sackmann (cold). The helper `_refresh_tournament_results`
+            # is kept available if Path B (discover seasonids from fixtures)
+            # is wired in later.
 
             for offset in range(fixture_lookahead_days + 1):
                 d = today + timedelta(days=offset)

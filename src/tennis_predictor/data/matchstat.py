@@ -40,9 +40,13 @@ TourCode = Literal["atp", "wta"]
 TOUR_LEVEL_TIERS: frozenset[str] = frozenset(
     {
         "Grand Slam",
-        "ATP 1000",
+        # matchstat's actual ATP tier strings as observed via the live API:
+        "ATP Masters 1000",
         "ATP 500",
         "ATP 250",
+        # WTA tier strings — names mirror ATP. Keep the "Masters 1000" form
+        # along with the bare "WTA 1000" until we've observed the live value.
+        "WTA Masters 1000",
         "WTA 1000",
         "WTA 500",
         "WTA 250",

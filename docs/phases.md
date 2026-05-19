@@ -64,20 +64,19 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
   | Endpoint | Purpose | Frequency |
   |---|---|---|
-  | `/{tour}/tournament/calendar/{year}` | Season inventory — drives the active-tournament filter via the `tier` field. | Weekly per tour, cached. |
-  | `/{tour}/fixtures/{date}?include=tournament.court,tournament.rank,round&filter=PlayerGroup:singles` | Upcoming fixtures → `scheduled_matches`. `include` brings surface (`court.name`) and round name; `filter` drops doubles. | Daily per tour. |
-  | `/{tour}/tournament/results/{seasonid}` | Completed matches + scores → `matches`. Pre-match odds (`odd1`/`odd2`) → `market_implied_probabilities`. | Daily per active tour-level event. |
+  | `/{tour}/tournament/calendar/{year}` | Tier-by-tournament-id lookup so `scheduled_matches.tournament_tier` can be populated. | Daily per tour (1 call). |
+  | `/{tour}/fixtures/{date}?include=tournament.court,tournament.rank,round&filter=PlayerGroup:singles` | Upcoming fixtures → `scheduled_matches`. `include` brings surface (`court.name`) and round name; `filter` drops doubles. | Daily per tour, paginated. |
   | `/{tour}/ranking/singles?pageSize=100` | Inter-week ranking overlay between weekly Sackmann snapshots. | Daily per tour. |
 
-  Tour-level whitelist on `tier`: `{"Grand Slam", "ATP 1000", "ATP 500", "ATP 250", "WTA 1000", "WTA 500", "WTA 250", "Finals"}`. Everything else (Challengers, ITF tiers like `"M15"`, `"M25"`) is dropped.
+  **Completed matches are NOT pulled from matchstat.** The first live smoke test surfaced that matchstat's `calendar/{year}` is forward-only: tournaments disappear from the listing once they start, so the "discover seasonid via calendar → fetch results" path silently misses the current week's events. Path C (chosen): completed matches come from Sackmann (cold, weekly git submodule). The trade-off is a 1–7 day lag for newly-finished matches in `matches`; for feature engineering this is a ~10% off-by-one in `last_10` form for active top players, well within model noise. The `tournament/results` endpoint and `insert_completed_matches` code stay in the codebase, exercised by unit tests, available if Path B (discover seasonid via fixtures' `tournamentId`) is wired in later.
 
-- **Budget.** Typical day: ~7–10 calls. Slam weeks: ~12–15. Bootstrap (back-fill the last ~30 days of completed results across ~20–30 recently-finished tour-level events): ~50 calls, one-off. Steady-state monthly: ~250–350 against the 500/month cap. Refresh script must avoid naive retry loops; per-call counts logged to `ingestion_runs`.
+  Tour-level whitelist on `tier`: `{"Grand Slam", "ATP Masters 1000", "ATP 500", "ATP 250", "WTA Masters 1000", "WTA 1000", "WTA 500", "WTA 250", "Finals"}`. Strings are matchstat's literal values, observed via the live API — the Masters tier uses the full `"ATP Masters 1000"` form, not bare `"ATP 1000"`. Everything outside this set (Challengers, ITF tiers like `"Future"`/`"M15"`/`"M25"`) is dropped.
+
+- **Budget.** Typical day under Path C: ~4 calls per tour (1 calendar + ~2 fixtures pages + 1 rankings). Both tours daily: ~8. Bursty days with full Slam draws: ~12. Steady-state monthly: ~150–250 against the 500/month cap. Refresh script must avoid naive retry loops; per-call counts logged to `ingestion_runs`.
 
 - **Upcoming fixtures lookahead is naturally short.** Tennis draws fix round 1 at the start of the week (Sun/Mon), and each subsequent round becomes known only once the previous round completes. The `scheduled_matches` table reflects whatever the API knows at refresh time: full round 1 right after a draw, rolling down to "today plus part of tomorrow" by mid-tournament. This is what the product lets users predict against; without it the app cannot surface "tonight's matches."
 
-- **Cross-source key.** Fixture `id` from `/fixtures/...` (small integer) and match `id` from `/tournament/results/...` (8-digit string) are **not** the same identifier. The link between a `scheduled_matches` row and the `matches` row produced when the match completes is the composite `(tournamentId, player1Id, player2Id, roundId)`, not a shared external id.
-
-- **Pre-match odds bonus.** `odd1`/`odd2` from `tournament/results` feed `market_implied_probabilities` for current events after overround normalization — the same pipeline as the cold tennis-data.co.uk loader. This removes the need to scrape tennis-data.co.uk for the trailing market window.
+- **Cross-source key.** Fixture `id` from `/fixtures/...` (small integer) and match `id` from `/tournament/results/...` (8-digit string) are **not** the same identifier. The link between a `scheduled_matches` row and the `matches` row produced when the match completes is the composite `(tournamentId, player1Id, player2Id, roundId)`, not a shared external id. Under Path C this is currently a near-no-op (Sackmann tourney_id doesn't match matchstat tournament_id), but `promote_completed_fixtures` remains wired for the future Path B case.
 
 - **New tables.** `scheduled_matches` (upcoming fixtures) and `ingestion_runs` (one row per refresh: run id, source, started_at, finished_at, rows added/skipped/failed, error if any) — the UI reads the freshness signal from `ingestion_runs`.
 
@@ -85,7 +84,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 - **Error budget.** When the hot API is unreachable or partial, the app degrades gracefully: predictions remain available against the last cached fixtures with a visible "data is N hours stale" warning, sourced from `ingestion_runs`.
 
-- **Tests.** Hot rows do not duplicate cold rows; daily refresh is idempotent; a fixture row promotes to a `matches` row (with result) when the match completes (composite-key match); ranking overlay never reads from the future; the tier-whitelist filter drops Challenger/ITF rows.
+- **Tests.** Hot rows do not duplicate cold rows; daily refresh is idempotent; ranking overlay never reads from the future; the tier-whitelist filter drops Challenger/ITF rows; orchestrator under Path C does NOT call `/tournament/results`.
 
 **Exit:**
 - `uv run python scripts/refresh_hot.py` runs end-to-end and updates DuckDB.

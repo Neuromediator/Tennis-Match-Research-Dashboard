@@ -159,43 +159,6 @@ def _calendar_tour_level_atp250(
     }
 
 
-def _calendar_itf_m15(season_id: int = 21701) -> dict[str, Any]:
-    return {
-        "id": season_id,
-        "name": "M15 Maringa",
-        "tier": "M15",
-        "date": "2026-05-11T00:00:00.000Z",
-        "court": {"id": 2, "name": "Clay"},
-        "rank": None,
-        "coutry": {"name": "Brazil", "acronym": "BRA"},
-    }
-
-
-def _result_match(
-    match_id: str = "84752520",
-    p1_id: int = 29935,
-    p1_name: str = "Tommy Paul",
-    p2_id: int = 82269,
-    p2_name: str = "Ethan Quinn",
-    winner_id: int = 29935,
-    result: str = "6-1 6-3",
-) -> dict[str, Any]:
-    return {
-        "id": match_id,
-        "date": "2026-05-17T17:15:00.000Z",
-        "roundId": 4,
-        "player1Id": p1_id,
-        "player2Id": p2_id,
-        "tournamentId": 21327,
-        "match_winner": winner_id,
-        "result": result,
-        "odd1": "1.38",
-        "odd2": "3.04",
-        "player1": {"id": p1_id, "name": p1_name, "countryAcr": "USA"},
-        "player2": {"id": p2_id, "name": p2_name, "countryAcr": "USA"},
-    }
-
-
 def _fixture(
     fx_id: int = 1215,
     p1_id: int = 37741,
@@ -240,11 +203,14 @@ def _ranking(
 
 
 def test_refresh_hot_happy_path(db: duckdb.DuckDBPyConnection) -> None:
-    """One tour-level tournament → one match inserted; one fixture; one ranking.
-    Status='success', ingestion_runs has the right counts."""
+    """Fixtures populated with tier from calendar, rankings written, status=success.
+
+    Under Path C the orchestrator does NOT fetch tournament/results — completed
+    matches come from Sackmann (cold). This test asserts the steady-state
+    hot-path: calendar (tier lookup) + fixtures + rankings + ingestion_runs row.
+    """
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    client.set_results("atp", 21327, {"data": {"singles": [_result_match()], "qualifying": []}})
     client.set_fixtures("atp", TODAY, {"data": [_fixture()], "hasNextPage": False})
     client.set_fixtures("atp", TODAY + timedelta(days=1), {"data": [], "hasNextPage": False})
     client.set_rankings("atp", [_ranking()])
@@ -254,19 +220,7 @@ def test_refresh_hot_happy_path(db: duckdb.DuckDBPyConnection) -> None:
     assert summary.status == "success"
     assert summary.requests_used > 0
 
-    # Match inserted with score and surface from calendar.
-    row = db.execute(
-        "SELECT winner_player_id, score, surface, tour FROM matches WHERE source = 'matchstat'"
-    ).fetchone()
-    assert row == ("ATP_29935", "6-1 6-3", "Clay", "ATP")
-
-    # Market odds inserted.
-    market = db.execute(
-        "SELECT odds_winner_close, odds_loser_close FROM market_implied_probabilities"
-    ).fetchone()
-    assert market == pytest.approx((1.38, 3.04))
-
-    # Fixture inserted with tournament tier from calendar.
+    # Fixture inserted with tournament tier sourced from calendar lookup.
     fix = db.execute(
         "SELECT tournament_tier, surface, round_name FROM scheduled_matches"
     ).fetchone()
@@ -275,6 +229,16 @@ def test_refresh_hot_happy_path(db: duckdb.DuckDBPyConnection) -> None:
     # Ranking overlay row inserted under today's date.
     rank = db.execute("SELECT ranking_date, player_id, rank FROM rankings").fetchone()
     assert rank == (TODAY, "ATP_106421", 1)
+
+    # No completed match rows from matchstat — Path C drops this path.
+    match_count = db.execute("SELECT COUNT(*) FROM matches WHERE source = 'matchstat'").fetchone()
+    assert match_count is not None and match_count[0] == 0
+
+    # No pre-match odds — they came as a bonus from tournament/results.
+    odds_count = db.execute(
+        "SELECT COUNT(*) FROM market_implied_probabilities WHERE odds_source = 'matchstat'"
+    ).fetchone()
+    assert odds_count is not None and odds_count[0] == 0
 
     # ingestion_runs row reflects success.
     run = db.execute(
@@ -288,46 +252,28 @@ def test_refresh_hot_happy_path(db: duckdb.DuckDBPyConnection) -> None:
     assert err is None
 
 
-def test_refresh_hot_skips_non_tour_level_tournaments(
+def test_refresh_hot_does_not_call_tournament_results(
     db: duckdb.DuckDBPyConnection,
 ) -> None:
-    """M15 (ITF Futures) is in calendar but must NOT trigger a tournament/results call."""
-    client = FakeMatchstatClient()
-    client.set_calendar(
-        "atp",
-        TODAY.year,
-        [_calendar_tour_level_atp250(), _calendar_itf_m15(season_id=99999)],
-    )
-    client.set_results("atp", 21327, {"data": {"singles": [_result_match()], "qualifying": []}})
-    # NOT registering /tournament/results/99999 — if the orchestrator wrongly
-    # asked for it, our fake would return an empty TournamentResults (a free
-    # request, but we'd notice via requests_used).
-    requests_before = client.requests_used
+    """Path C invariant: orchestrator must NOT call tournament/results.
 
+    We stage an active tour-level event in the calendar but register NO
+    results payload. If the orchestrator ever tried to fetch results, the
+    fake would still answer (empty payload, +1 request) but the request
+    count would betray us. Expect exactly: 1 calendar + 2 fixtures + 1 rankings.
+    """
+    client = FakeMatchstatClient()
+    client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
+    # Deliberately NOT calling set_results.
     refresh_hot(db, client, tours=["ATP"], today=TODAY)
 
-    # We expect: 1 calendar + 1 results (for the tour-level event) + 2 fixtures + 1 rankings = 5
-    # If M15 leaked through, we'd see 6+.
-    assert client.requests_used - requests_before == 5
-
-
-def test_refresh_hot_skips_long_finished_tournaments(db: duckdb.DuckDBPyConnection) -> None:
-    """Tournaments whose start_date is > 21 days ago are skipped."""
-    client = FakeMatchstatClient()
-    long_ago = _calendar_tour_level_atp250(season_id=11111, start=TODAY - timedelta(days=60))
-    client.set_calendar("atp", TODAY.year, [long_ago])
-    refresh_hot(db, client, tours=["ATP"], today=TODAY)
-
-    # No tournament/results call for the stale event.
-    result_count = db.execute("SELECT COUNT(*) FROM matches").fetchone()
-    assert result_count is not None and result_count[0] == 0
+    assert client.requests_used == 4  # 1 calendar + today + tomorrow + rankings
 
 
 def test_refresh_hot_paginates_fixtures(db: duckdb.DuckDBPyConnection) -> None:
     """fixtures_for_date with hasNextPage=True triggers a follow-up call."""
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    client.set_results("atp", 21327, {"data": {"singles": [], "qualifying": []}})
     # Two pages: first has 1 fixture and hasNextPage=True, second has 1 fixture and false.
     client.set_fixtures("atp", TODAY, {"data": [_fixture(fx_id=1)], "hasNextPage": True}, page_no=1)
     client.set_fixtures(
@@ -342,9 +288,15 @@ def test_refresh_hot_paginates_fixtures(db: duckdb.DuckDBPyConnection) -> None:
 
 
 def test_refresh_hot_promotes_completed_fixtures(db: duckdb.DuckDBPyConnection) -> None:
-    """Pre-existing scheduled_matches row whose composite key matches a
-    just-inserted matches row gets deleted by the promote pass."""
-    # Pre-stage a scheduled_match that lines up with the result we'll fetch.
+    """promote_completed_fixtures is still invoked at end-of-run.
+
+    Under Path C the hot path doesn't insert matches, but the function
+    stays wired — if a `matches` row with a matchstat-keyed
+    (tournament_id, players, round) tuple ever ends up in the table (via
+    a manual import, a future Path B, or a backfill script), the
+    promotion pass will still remove the corresponding scheduled fixture.
+    This test pre-seeds both manually and verifies the wiring.
+    """
     db.execute(
         """
         INSERT INTO scheduled_matches (
@@ -360,10 +312,20 @@ def test_refresh_hot_promotes_completed_fixtures(db: duckdb.DuckDBPyConnection) 
         )
         """
     )
+    db.execute(
+        """
+        INSERT INTO matches (
+            match_id, source, match_external_id, tour, match_tier,
+            tourney_id, tourney_date, match_num, match_status, round,
+            winner_player_id, loser_player_id
+        ) VALUES (
+            'matchstat::9001-done', 'matchstat', '84752520', 'ATP', 'main',
+            '21327', DATE '2026-05-17', 1, 'completed', '4',
+            'ATP_29935', 'ATP_82269'
+        )
+        """
+    )
     client = FakeMatchstatClient()
-    client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    client.set_results("atp", 21327, {"data": {"singles": [_result_match()], "qualifying": []}})
-
     summary = refresh_hot(db, client, tours=["ATP"], today=TODAY)
 
     assert summary.promoted_fixtures == 1
@@ -373,25 +335,23 @@ def test_refresh_hot_promotes_completed_fixtures(db: duckdb.DuckDBPyConnection) 
     assert count is not None and count[0] == 0
 
 
-def test_refresh_hot_marks_partial_when_player_unresolved(
+def test_refresh_hot_marks_partial_when_ranking_player_unresolved(
     db: duckdb.DuckDBPyConnection,
 ) -> None:
-    """An unresolved player in a completed match counts as `failed` (the row
-    can't be inserted) and bumps the run status from 'success' to 'partial'."""
+    """Unresolved player in a rankings entry counts as `failed`
+    (rankings.player_id is NOT NULL) and bumps status to 'partial'.
+
+    Path C analogue of the original 'unresolved-in-matches' test — same
+    contract, different surface (rankings is now the only NOT-NULL-blocking
+    insert path the orchestrator drives).
+    """
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    # Unknown player2: not in the seeded aliases.
-    client.set_results(
+    # Ranking entry references a player NOT in our seeded aliases.
+    client.set_rankings(
         "atp",
-        21327,
-        {
-            "data": {
-                "singles": [_result_match(p2_id=99999, p2_name="Mystery Stranger 99999")],
-                "qualifying": [],
-            }
-        },
+        [_ranking(position=1, player_id=99999, name="Mystery Stranger 99999")],
     )
-    client.set_rankings("atp", [])
 
     summary = refresh_hot(db, client, tours=["ATP"], today=TODAY)
 
@@ -427,7 +387,13 @@ def test_refresh_hot_writes_review_csv_when_buffer_nonempty(
     db: duckdb.DuckDBPyConnection,
     tmp_path: Path,
 ) -> None:
-    """A review-band lookup → CSV file is created with the candidate row."""
+    """A review-band lookup surfaces via fixtures → CSV file is written.
+
+    Reworked from the original results-based variant: under Path C the
+    orchestrator hits the resolver via fixtures (and rankings), not via
+    tournament/results. We exercise it through a fixture whose player1
+    name is close-but-not-identical to a seeded alias.
+    """
     db.execute(
         "INSERT INTO player_aliases (alias_text, tour, source, canonical_player_id, "
         "confidence) VALUES (?, ?, ?, ?, ?)",
@@ -435,23 +401,28 @@ def test_refresh_hot_writes_review_csv_when_buffer_nonempty(
     )
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    client.set_results(
+    # Player1 has a garbled name that should land in the review band (or higher).
+    client.set_fixtures(
         "atp",
-        21327,
+        TODAY,
         {
-            "data": {
-                "singles": [_result_match(p1_id=88888, p1_name="Tsitsi Stefa", winner_id=82269)],
-                "qualifying": [],
-            }
+            "data": [
+                _fixture(
+                    fx_id=2222,
+                    p1_id=88888,
+                    p1_name="Tsitsi Stefa",
+                )
+            ],
+            "hasNextPage": False,
         },
     )
 
     review_csv = tmp_path / "review.csv"
     refresh_hot(db, client, tours=["ATP"], today=TODAY, review_csv_path=review_csv)
 
-    # Only write the CSV if buffer is non-empty. If the fuzzy score didn't
-    # land in review band on this input, we soft-skip; the *structure* of the
-    # write is exercised in the dedicated review-csv test below.
+    # If the fuzzy score landed in the review band, the CSV was written.
+    # If it landed above auto or below unknown, no CSV — the *structure* of
+    # the write is exercised by the matchstat_resolver tests directly.
     if review_csv.exists():
         text = review_csv.read_text()
         assert "raw_name" in text  # header present
@@ -461,18 +432,23 @@ def test_refresh_hot_writes_review_csv_when_buffer_nonempty(
 def test_refresh_hot_summary_totals_aggregate_across_tours(
     db: duckdb.DuckDBPyConnection,
 ) -> None:
-    """Multi-tour run sums per-tour counts into RefreshSummary.totals."""
+    """Multi-tour run sums per-tour counts into RefreshSummary.totals.
+
+    Under Path C the contributions come from fixtures and rankings, not
+    completed matches — we still expect non-zero totals when both tours
+    have data, just from the surfaces that ARE driven by the orchestrator.
+    """
     client = FakeMatchstatClient()
-    # ATP side: 1 completed match + 1 fixture.
+    # ATP side: 1 fixture + 1 ranking.
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    client.set_results("atp", 21327, {"data": {"singles": [_result_match()], "qualifying": []}})
     client.set_fixtures("atp", TODAY, {"data": [_fixture()], "hasNextPage": False})
-    # WTA side: empty (no calendar, no fixtures).
+    client.set_rankings("atp", [_ranking()])
+    # WTA side: empty (no calendar, no fixtures, no rankings).
     summary = refresh_hot(db, client, tours=["ATP", "WTA"], today=TODAY)
 
     assert "ATP" in summary.per_tour
     assert "WTA" in summary.per_tour
-    assert summary.totals.added >= 2  # at least: match + fixture
+    assert summary.totals.added >= 2  # at least: fixture + ranking from ATP
 
 
 def test_refresh_hot_records_started_and_finished_timestamps(
