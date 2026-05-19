@@ -115,6 +115,14 @@ def insert_scheduled_matches(
     tier_lookup = tournament_tier_by_id or {}
     counts = LoadCounts()
     for fx in fixtures:
+        # Drop doubles teams — matchstat's `filter=PlayerGroup:singles` query
+        # param doesn't actually exclude them on the fixtures endpoint; they
+        # leak through with composite "Player1/Player2" names. Skipped here
+        # so the resolver isn't bothered with them and the review buffer
+        # stays focused on legitimate singles ambiguity.
+        if "/" in fx.player1.name or "/" in fx.player2.name:
+            counts += LoadCounts(skipped=1)
+            continue
         scheduled_match_id = f"{SOURCE_MATCHSTAT}::{fx.id}"
         surface = _map_surface(
             fx.tournament.court.name if fx.tournament and fx.tournament.court else None

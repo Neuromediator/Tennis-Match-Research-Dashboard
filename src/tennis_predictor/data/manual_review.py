@@ -1,14 +1,19 @@
 """Promote reviewed aliases into `player_aliases` as manually confirmed.
 
-Given a CSV file with the same schema that `load_market.py` writes for
-review (tour, winner_raw, winner_player_id, loser_raw, loser_player_id, ...),
-extract each unique (raw_name, tour, canonical_player_id) tuple from both
-winner and loser sides and insert into `player_aliases` with
-`source='manual_review'` and `confidence=1.0`. Idempotent via
-`ON CONFLICT DO NOTHING`.
+Two CSV schemas are supported and auto-detected by their column set:
 
-After running, the same raw names hit the exact-match fast path in
-AliasIndex on future refreshes — no more review entries for them.
+- **Paired format** (Phase 1, written by `load_market.py`): one row per
+  match with both winner and loser names already linked to canonical IDs.
+  Confirms each unique (raw, canonical) pair from both sides.
+- **Per-player format** (Phase 2, written by `refresh_hot.py` for the
+  matchstat hot source): one row per low-confidence resolution, the
+  reviewer fills a `verdict` column with 'y' to confirm. Rows without
+  'y' are dropped.
+
+In both cases, confirmed pairs INSERT into `player_aliases` with
+`source='manual_review'` and `confidence=1.0`. Idempotent via
+`ON CONFLICT DO NOTHING`. After running, the same raw names hit the
+exact-match fast path in AliasIndex on future refreshes.
 """
 
 from __future__ import annotations
@@ -20,26 +25,39 @@ import pandas as pd
 
 MANUAL_SOURCE = "manual_review"
 
-_REQUIRED_COLUMNS = frozenset(
+# Each tuple = required columns of one supported schema. The first tuple
+# whose columns are all present in the CSV wins; the other branch is skipped.
+_PAIRED_REQUIRED = frozenset(
     {"tour", "winner_raw", "winner_player_id", "loser_raw", "loser_player_id"}
 )
+_MATCHSTAT_REQUIRED = frozenset({"raw_name", "tour", "candidate_canonical_id", "verdict"})
 
 
 def apply_review(conn: duckdb.DuckDBPyConnection, csv_path: Path) -> dict[str, int]:
     """Read a reviewed CSV and insert manually-confirmed aliases.
 
-    Returns a summary dict with keys csv_rows, unique_pairs, newly_inserted,
-    already_present.
+    Auto-detects format (paired vs per-player). Returns a summary dict
+    with keys csv_rows, unique_pairs, newly_inserted, already_present.
     """
     if not csv_path.exists():
         raise FileNotFoundError(csv_path)
 
     df = pd.read_csv(csv_path)
+    columns = set(df.columns)
 
-    missing = _REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"{csv_path} is missing required columns: {sorted(missing)}")
+    if _PAIRED_REQUIRED.issubset(columns):
+        return _apply_paired(conn, df)
+    if _MATCHSTAT_REQUIRED.issubset(columns):
+        return _apply_matchstat(conn, df)
+    raise ValueError(
+        f"{csv_path} columns {sorted(columns)} match neither the paired "
+        f"format ({sorted(_PAIRED_REQUIRED)}) nor the matchstat format "
+        f"({sorted(_MATCHSTAT_REQUIRED)})."
+    )
 
+
+def _apply_paired(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> dict[str, int]:
+    """Paired (Phase 1) schema: winner+loser both pre-linked to canonicals."""
     winner_pairs = df[["winner_raw", "tour", "winner_player_id"]].rename(
         columns={  # pyright: ignore[reportCallIssue]
             "winner_raw": "alias_text",
@@ -53,10 +71,35 @@ def apply_review(conn: duckdb.DuckDBPyConnection, csv_path: Path) -> dict[str, i
         }
     )
     all_pairs = pd.concat([winner_pairs, loser_pairs], ignore_index=True)
-    all_pairs = all_pairs.dropna(subset=["alias_text", "canonical_player_id"])
-    all_pairs = all_pairs[all_pairs["alias_text"].astype(str).str.strip() != ""]
+    return _insert_aliases(conn, df_rows=len(df), pairs=all_pairs)
 
-    unique = all_pairs.drop_duplicates(
+
+def _apply_matchstat(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> dict[str, int]:
+    """Per-player (Phase 2) schema: reviewer marks `verdict='y'` to confirm
+    a `raw_name -> candidate_canonical_id` link.
+
+    Anything other than literal 'y' / 'Y' (case-insensitive, trimmed) is a
+    reject — including blank, 'n', 'no', 'skip'.
+    """
+    verdicts = df["verdict"].astype(str).str.strip().str.lower()
+    confirmed: pd.DataFrame = df[verdicts == "y"].copy()  # pyright: ignore[reportAssignmentType]
+    pairs: pd.DataFrame = confirmed[["raw_name", "tour", "candidate_canonical_id"]].rename(
+        columns={  # pyright: ignore[reportCallIssue]
+            "raw_name": "alias_text",
+            "candidate_canonical_id": "canonical_player_id",
+        }
+    )
+    return _insert_aliases(conn, df_rows=len(df), pairs=pairs)
+
+
+def _insert_aliases(
+    conn: duckdb.DuckDBPyConnection, *, df_rows: int, pairs: pd.DataFrame
+) -> dict[str, int]:
+    pairs = pairs.dropna(subset=["alias_text", "canonical_player_id"])
+    pairs = pairs[pairs["alias_text"].astype(str).str.strip() != ""]  # pyright: ignore[reportAssignmentType]
+    pairs = pairs[pairs["canonical_player_id"].astype(str).str.strip() != ""]  # pyright: ignore[reportAssignmentType]
+
+    unique = pairs.drop_duplicates(
         subset=["alias_text", "tour", "canonical_player_id"]  # pyright: ignore[reportCallIssue]
     ).copy()
 
@@ -80,7 +123,7 @@ def apply_review(conn: duckdb.DuckDBPyConnection, csv_path: Path) -> dict[str, i
 
     after = _count_manual(conn)
     return {
-        "csv_rows": len(df),
+        "csv_rows": df_rows,
         "unique_pairs": len(unique),
         "newly_inserted": after - before,
         "already_present": len(unique) - (after - before),

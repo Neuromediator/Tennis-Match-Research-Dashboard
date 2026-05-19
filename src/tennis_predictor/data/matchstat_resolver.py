@@ -38,12 +38,15 @@ class ReviewCandidate:
 
     Mirrors the fields a reviewer needs to make the call: the raw name
     from matchstat, the candidate alias_text we'd auto-link it to, the
-    confidence score, and the runner-up score to flag ambiguity.
+    Sackmann canonical_player_id of that candidate (so the reviewer
+    doesn't have to look it up), the confidence score, and the runner-up
+    score to flag ambiguity.
     """
 
     raw_name: str
     tour: TourArg
     candidate_name: str | None
+    candidate_canonical_id: str | None
     confidence: float
     runner_up_confidence: float
 
@@ -92,6 +95,7 @@ class MatchstatResolver:
                     raw_name=name,
                     tour=tour_typed,
                     candidate_name=result.candidate_name,
+                    candidate_canonical_id=result.canonical_player_id,
                     confidence=result.confidence,
                     runner_up_confidence=result.runner_up_confidence,
                 )

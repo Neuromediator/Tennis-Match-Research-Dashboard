@@ -71,12 +71,23 @@ Always normalize unicode (precomposed letters like Đ/Ł/Ø/Æ/Þ/ß require exp
 
 ## Audit artefacts
 
-Each refresh writes two append-only CSVs under `data/processed/`:
+Each refresh writes append-only CSVs under `data/processed/`:
 
-- `aliases_review.csv` — fuzzy resolved at low confidence. Workflow above.
+- `aliases_review.csv` (Phase 1, paired schema) — tennis-data.co.uk low-confidence resolutions.
+- `aliases_review_matchstat.csv` (Phase 2, per-player schema) — matchstat low-confidence resolutions. Columns: `raw_name, tour, candidate_name, candidate_canonical_id, confidence, runner_up_confidence, verdict`. The reviewer fills `verdict` with `y` to accept a row.
 - `unmatched_market_rows.csv` — fuzzy succeeded but the JOIN against `matches` returned zero candidates. Most common cause: same-surname collision in the abbreviated-form seed. Analyzed in `notebooks/explore_unmatched.ipynb`.
 
-Both are append-only across runs — older entries persist so the file doubles as a long-term record of edge cases.
+Append-only across runs — older entries persist so each file doubles as a long-term record of edge cases.
+
+### matchstat review workflow
+
+1. Run `uv run python scripts/refresh_hot.py` (or wait for the daily cron in deployment).
+2. Open `data/processed/aliases_review_matchstat.csv` in Google Sheets / LibreOffice / a CSV editor.
+3. For each row, compare `raw_name` (matchstat) and `candidate_name` (best Sackmann match). If they're the same player, type `y` in the `verdict` column. Anything else (blank, `n`, `no`, `skip`) is a reject. `candidate_canonical_id` is pre-filled — the reviewer never needs to look up player IDs by hand.
+4. Save the file (CSV format) back to the same path.
+5. Run `uv run python scripts/apply_aliases_review.py --csv data/processed/aliases_review_matchstat.csv`. The script auto-detects the schema and promotes `y` rows into `player_aliases` with `source='manual_review'`. Idempotent — re-running with the same verdicts inserts nothing new.
+
+After the promotion, the same matchstat names hit the AliasIndex exact-match fast path on the next refresh — they no longer appear in `aliases_review_matchstat.csv`.
 
 ## DuckDB conventions
 

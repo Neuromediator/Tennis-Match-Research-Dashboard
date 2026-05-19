@@ -72,7 +72,29 @@ Slams run 14 days; ATP/WTA 1000s run up to 12; everything else is ≤8.
 21 days covers the Slam case plus a buffer for late-arriving results
 without triggering re-fetches of long-finished events."""
 
-REVIEW_CSV_FIELDNAMES = ["raw_name", "tour", "candidate_name", "confidence", "runner_up_confidence"]
+REVIEW_CSV_FIELDNAMES = [
+    "raw_name",
+    "tour",
+    "candidate_name",
+    "candidate_canonical_id",
+    "confidence",
+    "runner_up_confidence",
+    "verdict",
+]
+"""Columns of the matchstat review CSV.
+
+- `raw_name`            : the matchstat name we tried to resolve
+- `tour`                : 'ATP' or 'WTA'
+- `candidate_name`      : best Sackmann alias the fuzzy matcher landed on
+- `candidate_canonical_id`: that candidate's canonical player_id (so the
+                          reviewer doesn't have to look it up). The reviewer's
+                          job is verify, not produce IDs.
+- `confidence`          : 0..1
+- `runner_up_confidence`: 0..1
+- `verdict`             : blank in the generated CSV. Reviewer writes 'y' to
+                          confirm raw_name -> candidate_canonical_id;
+                          anything else (blank/'n'/'no') means reject.
+"""
 
 
 class MatchstatClientProtocol(Protocol):
@@ -205,8 +227,10 @@ def _write_review_csv(buffer_path: Path, candidates: list, append: bool = True) 
                     "raw_name": c.raw_name,
                     "tour": c.tour,
                     "candidate_name": c.candidate_name,
+                    "candidate_canonical_id": c.candidate_canonical_id,
                     "confidence": f"{c.confidence:.4f}",
                     "runner_up_confidence": f"{c.runner_up_confidence:.4f}",
+                    "verdict": "",  # left blank for the reviewer
                 }
             )
     return len(candidates)
