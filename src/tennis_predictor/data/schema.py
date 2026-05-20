@@ -217,16 +217,64 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
 );
 """
 
-# TODO(phase-3): feature columns are designed in phase 3. This placeholder
-# exists so the schema check passes and the table name is reserved. Phase 3
-# will likely DROP + CREATE this table with the full FeatureVector layout
-# (we are deliberately not paying ALTER TABLE costs for a table with no
-# data yet).
+# Phase 3: full FeatureVector layout (28 features) — see
+# src/tennis_predictor/features/schema.py for the Pydantic contract.
+# Required columns (NOT NULL): Elo (3), H2H wins (2), fatigue (4), ranking
+# (3), tournament context (3), plus identifying/label columns. Nullable:
+# recent form (4), serve/return rolling (8), h2h_recency_days. The set of
+# nullable columns matches the FeatureVector fields that allow None.
 TRAINING_FEATURES_DDL = """
 CREATE TABLE IF NOT EXISTS training_features (
-    match_id            VARCHAR PRIMARY KEY,
-    label_winner_is_p1  INTEGER NOT NULL,
-    schema_version      INTEGER NOT NULL DEFAULT 1
+    match_id                      VARCHAR PRIMARY KEY,
+    tour                          VARCHAR NOT NULL,
+    match_date                    DATE NOT NULL,
+    p1_player_id                  VARCHAR NOT NULL,
+    p2_player_id                  VARCHAR NOT NULL,
+    label_winner_is_p1            INTEGER NOT NULL,
+
+    -- Surface-Elo (3)
+    elo_p1_surface                DOUBLE NOT NULL,
+    elo_p2_surface                DOUBLE NOT NULL,
+    elo_diff_surface              DOUBLE NOT NULL,
+
+    -- Recent form (4) — nullable when window < 3 matches
+    win_pct_last10_p1             DOUBLE,
+    win_pct_last10_p2             DOUBLE,
+    win_pct_last25_surface_p1     DOUBLE,
+    win_pct_last25_surface_p2     DOUBLE,
+
+    -- Serve/return rolling (8) — nullable when < 5 stat-rich matches in window
+    first_serve_win_pct_p1        DOUBLE,
+    first_serve_win_pct_p2        DOUBLE,
+    second_serve_win_pct_p1       DOUBLE,
+    second_serve_win_pct_p2       DOUBLE,
+    bp_saved_pct_p1               DOUBLE,
+    bp_saved_pct_p2               DOUBLE,
+    bp_converted_pct_p1           DOUBLE,
+    bp_converted_pct_p2           DOUBLE,
+
+    -- H2H (3) — recency_days nullable when never met
+    h2h_p1_wins                   INTEGER NOT NULL,
+    h2h_p2_wins                   INTEGER NOT NULL,
+    h2h_recency_days              INTEGER,
+
+    -- Fatigue (4)
+    fatigue_matches_7d_p1         INTEGER NOT NULL,
+    fatigue_matches_7d_p2         INTEGER NOT NULL,
+    fatigue_sets_14d_p1           INTEGER NOT NULL,
+    fatigue_sets_14d_p2           INTEGER NOT NULL,
+
+    -- Ranking (3) — 9999 sentinel for unranked
+    rank_p1                       INTEGER NOT NULL,
+    rank_p2                       INTEGER NOT NULL,
+    rank_diff                     INTEGER NOT NULL,
+
+    -- Tournament context (3)
+    tournament_level              VARCHAR NOT NULL,
+    best_of                       INTEGER NOT NULL,
+    surface                       VARCHAR NOT NULL,
+
+    schema_version                INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -246,6 +294,8 @@ INDEXES = [
     "player2_external_id, round_external_id);",
     "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source_started "
     "ON ingestion_runs(source, started_at);",
+    "CREATE INDEX IF NOT EXISTS idx_training_features_tour_date "
+    "ON training_features(tour, match_date);",
 ]
 
 TABLE_DDL: list[str] = [
@@ -278,8 +328,33 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
 )
 
 
+def _migrate_training_features(conn: duckdb.DuckDBPyConnection) -> None:
+    """One-time migration: drop the Phase 1 placeholder shape so the
+    Phase 3 layout can take its place.
+
+    The Phase 1 schema reserved `training_features` with just
+    `(match_id, label_winner_is_p1, schema_version)` — never populated. We
+    detect the placeholder by checking for the `tournament_level` column
+    (added in Phase 3) and DROP when absent. Loses no data — the placeholder
+    was always empty.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'training_features' AND column_name = 'tournament_level'"
+    ).fetchone()
+    table_exists = (
+        conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'training_features'"
+        ).fetchone()
+        is not None
+    )
+    if table_exists and row is None:
+        conn.execute("DROP TABLE training_features")
+
+
 def create_all_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every table and index. Idempotent."""
+    _migrate_training_features(conn)
     for ddl in TABLE_DDL:
         conn.execute(ddl)
     for idx in INDEXES:

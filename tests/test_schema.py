@@ -130,6 +130,89 @@ def test_scheduled_matches_rejects_duplicate_external_id(
         fresh_db.execute(base_sql, ["matchstat::1215-dup"])
 
 
+def test_training_features_has_phase3_layout(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Phase 3 schema must include every FeatureVector field plus identifiers."""
+    schema.create_all_tables(fresh_db)
+    cols = {
+        row[0]
+        for row in fresh_db.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'training_features'"
+        ).fetchall()
+    }
+    expected = {
+        # identifiers + label
+        "match_id",
+        "tour",
+        "match_date",
+        "p1_player_id",
+        "p2_player_id",
+        "label_winner_is_p1",
+        # Surface-Elo (3)
+        "elo_p1_surface",
+        "elo_p2_surface",
+        "elo_diff_surface",
+        # Recent form (4)
+        "win_pct_last10_p1",
+        "win_pct_last10_p2",
+        "win_pct_last25_surface_p1",
+        "win_pct_last25_surface_p2",
+        # Serve/return (8)
+        "first_serve_win_pct_p1",
+        "first_serve_win_pct_p2",
+        "second_serve_win_pct_p1",
+        "second_serve_win_pct_p2",
+        "bp_saved_pct_p1",
+        "bp_saved_pct_p2",
+        "bp_converted_pct_p1",
+        "bp_converted_pct_p2",
+        # H2H (3)
+        "h2h_p1_wins",
+        "h2h_p2_wins",
+        "h2h_recency_days",
+        # Fatigue (4)
+        "fatigue_matches_7d_p1",
+        "fatigue_matches_7d_p2",
+        "fatigue_sets_14d_p1",
+        "fatigue_sets_14d_p2",
+        # Ranking (3)
+        "rank_p1",
+        "rank_p2",
+        "rank_diff",
+        # Tournament context (3)
+        "tournament_level",
+        "best_of",
+        "surface",
+        # bookkeeping
+        "schema_version",
+    }
+    missing = expected - cols
+    assert not missing, f"training_features missing Phase 3 columns: {missing}"
+
+
+def test_training_features_migration_drops_phase1_placeholder(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """If a Phase 1 placeholder shape exists, create_all_tables must replace it."""
+    fresh_db.execute(
+        "CREATE TABLE training_features ("
+        "match_id VARCHAR PRIMARY KEY, "
+        "label_winner_is_p1 INTEGER NOT NULL, "
+        "schema_version INTEGER NOT NULL DEFAULT 1)"
+    )
+    schema.create_all_tables(fresh_db)
+    cols = {
+        row[0]
+        for row in fresh_db.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'training_features'"
+        ).fetchall()
+    }
+    assert "tournament_level" in cols, "Migration did not run; placeholder still in place"
+
+
 def test_ingestion_runs_accepts_well_formed_row(
     fresh_db: duckdb.DuckDBPyConnection,
 ) -> None:

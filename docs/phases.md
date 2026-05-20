@@ -47,7 +47,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 - Match rate vs tennis-data.co.uk: ~65–85% per year (median ~75%)
 
 **Known limits, documented for later phases:**
-- tennis-data.co.uk archive prior to ~2013 is served as `.xls` (legacy binary). The downloader detects and skips these years cleanly. Adding `xlrd` to read them is a small future task.
+- tennis-data.co.uk pre-2013 archive: we currently download `.xlsx`, and that format is not published for earlier years (the site detects an `.xls`-only landing page and our loader skips with a warning). **CORRECTION (Phase 3 review):** tennis-data.co.uk also publishes a CSV variant for every year, including pre-2013. Switching the loader from `.xlsx` to CSV is a small future task that unlocks ~10 extra years of market benchmark coverage. Odds are not training features (CLAUDE.md hard rule #3), so adding them does NOT require a rebuild of `training_features` / `elo_state` — only the `market_implied_probabilities` table grows. Deferred until Phase 4 calibration reporting actually needs the older years.
 - ~840 ATP and ~1945 WTA players share a `full_name` in Sackmann's roster (different IDs). `find_namesakes()` surfaces them; phase 2/3 needs a per-source disambiguator before merging.
 
 ---
