@@ -52,7 +52,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 2 — Hot data layer
+## Phase 2 — Hot data layer  ✅ complete
 
 **Entry:** phase 1 exit criteria met.
 
@@ -94,7 +94,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 3 — Feature engineering
+## Phase 3 — Feature engineering  ✅ complete
 
 **Entry:** phase 2 exit criteria met.
 
@@ -106,10 +106,30 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 - Rolling, H2H, fatigue, and ranking features.
 - Leakage tests: tampered-future-rows fixtures, asserting no past feature value moves.
 
-**Exit:**
-- All leakage tests pass in CI.
-- `training_features` has one row per eligible match, with no nulls in required feature columns.
-- `compute_features` returns identical values for the same `(player, opponent, surface, as_of_date)` whether reached via training replay or inference path.
+**Exit (all green):**
+- ✅ All 12 anti-leakage tests pass in CI (tampered-future-rows: winner/loser swap, score, stats, surface, indoor-name promotion, ranking insert, INSERT/DELETE).
+- ✅ `training_features` has one row per eligible match, with no nulls in required feature columns (verified by `test_required_columns_non_null`).
+- ✅ `compute_features` returns identical values for the same `(player, opponent, surface, as_of_date)` whether reached via training replay or inference path (verified by `test_equivalence_with_training_replay`).
+
+**Headline numbers (full DB):**
+- 1,701,617 matches scanned, 1,635,925 state updates applied.
+- **369,064 training_features rows** written (ATP main 169k + ATP qualifying 30k + WTA main 131k + WTA qualifying 38k).
+- 106,404 `elo_state` rows persisted (one per `(player_id, surface)` pair with at least one completed match).
+- ~5 min wall-time for a full replay on the populated DB.
+- Skip breakdown: 56,745 non-completed (RET/W/O/DEF), 8,947 null-surface, 1,220,289 non-main-tier (Challengers/Futures/ITF — feed state, no labels), 28,239 excluded level (Davis Cup, Olympics, WTA OOS, WTA 125), 18,214 below history floor.
+- Label balance ~53/47 in favour of `label=1` — lex-ordering by `player_id` correlates lightly with career length; LightGBM handles class imbalance natively.
+- 271 tests pass (Phase 1+2+3 combined).
+
+**Implementation notes (post-design):**
+- 5 in-memory state objects + 1 in-memory lookup: `EloState` (persisted), `RollingFormState`, `H2HState`, `FatigueState`, `ServeReturnState` (rebuilt each run) and `RankingLookup` (bisect over `rankings` table).
+- Surface taxonomy: `{Hard, IHard, Clay, Grass}`. Carpet → IHard. Indoor whitelist (`src/tennis_predictor/features/indoor_tournaments.py`) lifts Paris Bercy / Vienna / Rotterdam / etc. from Hard to IHard.
+- Tournament-level normalization: 7 canonical values (Slam, M1000, ATP500/250, WTA500/250, Finals). ATP `A` disambiguated via hardcoded 500-list; WTA legacy Tier I-V mapped to modern equivalents; D/O/WTA-125 excluded.
+- History floor: both players must have ≥5 completed matches; canonical `(p1, p2)` is lex-smaller `player_id` first.
+- Tour-level main-draw qualifying (Q1/Q2/Q3 at Slams/Masters/250-500) is label-eligible per user decision — Sackmann stores them inside `qual_chall` / `qual_itf` files mixed with Challengers/ITF, whitelisted by per-tour level codes.
+- `compute_features` rebuilds Elo from scratch when `as_of_date ≤ persisted snapshot date` — necessary for historical inference (e.g., the equivalence test) since the snapshot reflects state **after** every DB match.
+
+**Known limits, documented for later phases:**
+- Market odds for qualifying matches: currently 0 rows in `market_implied_probabilities` for qual_chall / qual_itf tiers. Likely a `load_market.py` JOIN bug (tennis-data.co.uk does publish qualifying odds). Phase 4 calibration plots will be main-draw only until this is fixed.
 
 ---
 

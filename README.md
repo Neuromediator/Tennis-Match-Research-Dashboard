@@ -4,7 +4,7 @@ A working tool that gives calibrated win probabilities for upcoming ATP and WTA 
 
 **Not a betting tool — we do not claim to beat the market.**
 
-**Status:** Phase 1 (cold data layer) complete — see [docs/phases.md](docs/phases.md). Phase 2 (hot data layer) is next.
+**Status:** Phases 1 (cold data), 2 (hot data), and 3 (feature engineering) complete — see [docs/phases.md](docs/phases.md). Phase 4 (modeling: walk-forward validation, LightGBM + Elo baseline, calibration) is next.
 
 See [docs/architecture.md](docs/architecture.md), [docs/methodology.md](docs/methodology.md), and [docs/phases.md](docs/phases.md) for details.
 
@@ -21,8 +21,14 @@ uv run pytest
 uv run python scripts/refresh_data.py            # incremental (default)
 uv run python scripts/refresh_data.py --clean    # full rebuild from scratch
 
-# Promote reviewed aliases (after editing data/processed/aliases_review.csv)
+# Daily hot refresh (matchstat fixtures + rankings)
+uv run python scripts/refresh_hot.py
+
+# Promote reviewed aliases (after editing data/processed/aliases_review*.csv)
 uv run python scripts/apply_aliases_review.py
+
+# Build the training_features table + persist elo_state (phase 3)
+uv run python scripts/build_features.py
 
 # (later phases)
 uv run python scripts/train_models.py            # phase 4

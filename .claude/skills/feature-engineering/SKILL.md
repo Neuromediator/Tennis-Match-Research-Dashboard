@@ -9,26 +9,48 @@ description: Use when adding or modifying features, building the training table,
 
 There are exactly two sanctioned entry points. Anything else is a bug.
 
-### `build_training_features()`
+### `build_training_features(conn) -> BuildSummary`
 
 Chronological replay over every match in the database. Maintains in-memory **state objects**:
 
-- `EloState` — rating per `(player_id, surface)`.
-- `RollingFormState` — last-N match results per player.
-- `H2HState` — pairwise counters.
-- `FatigueState` — matches and sets in last 7/14 days.
+- `EloState` — rating per `(player_id, surface)`. K=32, default 1500. **Persisted** to `elo_state` table at end of replay.
+- `RollingFormState` — per-player list of `(date, surface, won)`. Snapshots `(win_pct_last10_any, win_pct_last25_surface)`.
+- `H2HState` — pairwise counters keyed by canonical (lex-sorted) player pair.
+- `FatigueState` — per-player rolling counts: matches in last 7d, sets in last 14d.
+- `ServeReturnState` — per-player surface-filtered last-25 serve/return raw counts (skips matches with NULL stat columns).
 
-For each match, in chronological order:
+Plus `RankingLookup` (in-memory bisect over the `rankings` table — not a state object, but used by the orchestrator).
 
-1. Read pre-match state for both players → produce a `FeatureVector`.
-2. Write a row to the `training_features` table: `(match_id, p1_features..., p2_features..., label)`.
-3. **Then** update state with the match result.
+For each match, in chronological order (`tourney_date ASC, tourney_id ASC, match_num ASC, match_id ASC`):
 
-Step ordering is critical. State must never be updated before the snapshot is taken.
+1. Apply the **state-update gate**: must be `match_status='completed'` AND `surface` (after normalization) is not None. RET / W/O / DEF / NULL-surface rows are skipped from BOTH state AND labels.
+2. Apply the **label-write gate** (additional, on top of state gate):
+   - `match_tier == 'main'` OR tour-level main-draw qualifying (ATP `qual_chall` with `tourney_level in {G, M, A}`; WTA `qual_itf` with `tourney_level in {G, PM, P, I, T1, T2, W}`).
+   - Normalized `tournament_level` is not None (excludes D, O, WTA-OOS, WTA-125).
+   - `best_of in (3, 5)`.
+   - Both players have ≥ 5 completed matches in history (the "history floor").
+3. If label-eligible: pick `(p1, p2)` as lex-sorted player IDs. Read pre-match state from all 5 state objects + `RankingLookup` → build a `FeatureVector`. Write a row to `training_features` with `label_winner_is_p1 = 1` iff the actual winner was `p1`.
+4. **Then** update all state objects with the match result.
 
-### `compute_features(player_id, opponent_id, surface, tour, as_of_date) -> FeatureVector`
+Step ordering (snapshot → write → update) is critical. State must never be updated before the snapshot is taken.
 
-Inference path. Reads the most recent state snapshot with `snapshot_date ≤ as_of_date`, rolls forward through any matches in `(snapshot_date, as_of_date)`, then computes the vector. Returns a Pydantic `FeatureVector`.
+`training_features` is fully overwritten on each run (DELETE + bulk INSERT in one transaction). `elo_state` is overwritten as a full snapshot at the end. Other state objects are NOT persisted; they rebuild from scratch each run.
+
+### `compute_features(conn, player_id, opponent_id, surface, tour, as_of_date, tournament_level, best_of, *, elo=None, ranking_lookup=None) -> FeatureVector`
+
+Inference path. Returns a Pydantic `FeatureVector` for a single hypothetical `(p1, p2, surface, as_of_date)` instance.
+
+Algorithm:
+
+1. Canonical ordering: `(p1, p2) = sorted([player_id, opponent_id])`.
+2. Load `RankingLookup` from `rankings` (or accept caller-supplied cache).
+3. Elo decision: if `persisted_snapshot_date < as_of_date`, load `EloState.from_db(conn)` and roll forward through matches in the gap. **Otherwise** (historical inference / equivalence test) rebuild `EloState` from scratch — the persisted snapshot reflects state AFTER every DB match and would leak the target match's update.
+4. Build the other 4 state objects fresh by querying every completed, surface-resolved match involving `p1` OR `p2` with `match_date < as_of_date`. Replay in chronological order into all states.
+5. Snapshot each state → assemble `FeatureVector` via `model_validate`.
+
+The equivalence contract (Phase 3 exit criterion): `compute_features` returns identical values to the corresponding row in `training_features` for the same `(player, opponent, surface, as_of_date)`. Tested in `tests/test_compute_features.py::test_equivalence_with_training_replay`.
+
+`elo` and `ranking_lookup` may be passed pre-loaded so a Streamlit session amortizes the load across many predictions (Phase 6 concern).
 
 ## The hard rule
 
@@ -85,14 +107,55 @@ R_A_new = R_A + K * (S_A - E_A)
 - Storage: one row per `(player_id, surface)` in `elo_state`. ~137k players × 4 surfaces = ~550k rows — fits in memory during replay.
 - Persistence: snapshotted after each `build_training_features()` run; inference rolls forward incrementally from snapshot using any matches with `snapshot_date < match_date ≤ as_of_date`.
 
+## Surface taxonomy
+
+4 canonical values: `Hard`, `IHard`, `Clay`, `Grass`. Normalization happens in `features.surface.normalize_surface(raw_surface, tourney_name)`:
+
+- `Carpet` → `IHard` (carpet was always indoor; merging keeps indoor-hard ratings continuous through the 2009 transition).
+- `Hard` + tournament in `INDOOR_TOURNAMENTS` whitelist → `IHard` (Paris Bercy, Vienna, Rotterdam, Basel, Marseille, Stockholm, Memphis, ATP Finals, WTA Finals, Linz, Luxembourg, Quebec, Zurich, etc.).
+- `Hard` otherwise → `Hard` (outdoor).
+- `Clay` (case-insensitive: `'clay'` and `'Clay'` both map) → `Clay`.
+- `Grass` → `Grass`.
+- `NULL` or unrecognized → `None` (match is excluded from BOTH state AND labels).
+
+The indoor whitelist is hand-curated in `src/tennis_predictor/features/indoor_tournaments.py`. Review by reading the file.
+
+## Tournament-level taxonomy
+
+7 canonical values: `Slam`, `M1000`, `ATP500`, `ATP250`, `WTA500`, `WTA250`, `Finals`. Normalization in `features.tournament_level.normalize_tournament_level(tour, raw_level, tourney_name)`:
+
+- `G` → `Slam`; `F` → `Finals` (tour-agnostic).
+- `D` (Davis Cup), `O` (Olympics) → `None` (excluded from labels by user decision).
+- ATP: `M` → `M1000`; `A` + name in `ATP_500_TOURNAMENTS` → `ATP500`, else `ATP250`.
+- WTA modern: `PM` → `M1000`; `P` → `WTA500`; `I` → `WTA250`.
+- WTA legacy (pre-2009): `T1` → `M1000`; `T2` → `WTA500`; `T3/T4/T5` → `WTA250`.
+- WTA catch-all: `W` → `WTA250` (default).
+- WTA out-of-scope (`CC`, `E`, `50+H`, `35+H`, `J`) → `None`.
+- WTA 125 events (Challenger-equivalent for women): caught by `'125'` substring in `tourney_name`, returns `None` regardless of declared tier.
+
+The ATP 500 list is hand-curated in `features.tournament_level.ATP_500_TOURNAMENTS`.
+
 ## State storage
 
-- `elo_state` is persisted to DuckDB after each `build_training_features` run; inference reads it and rolls forward.
-- Other state objects are rebuilt in-memory each training run (cheap on our data volume); not persisted.
+- `elo_state` is persisted to DuckDB after each `build_training_features` run; inference reads it and rolls forward (or rebuilds from scratch if `as_of_date <= snapshot_date`).
+- Other state objects (`RollingForm`, `H2H`, `Fatigue`, `ServeReturn`) are rebuilt in-memory each training run (cheap on our data volume); not persisted.
+- `RankingLookup` is rebuilt on demand from the `rankings` table; ~5.6M rows fit in memory as parallel `{player_id: [dates], [ranks]}` arrays with O(log N) bisect.
+
+## NaN policy in the FeatureVector
+
+Required (never None): Elo (3), H2H wins (2), fatigue (4), ranking (3, with `9999` sentinel for unranked), tournament context (3).
+
+Optional (None allowed):
+- Recent form (4): None when window has < 3 matches.
+- Serve/return (8): None when surface-filtered window has < 5 matches with non-null stat columns (~58% of pre-1990s `main` matches have NULL serve stats in Sackmann).
+- `h2h_recency_days`: None when the pair has never met.
 
 ## When you add a feature
 
 1. Add the field to `FeatureVector` with type and bounds.
-2. Add the computation to the appropriate state object.
-3. Add a leakage test that proves it can't see the future.
-4. Run `build_training_features()` end-to-end and commit the regenerated metadata.
+2. Add the computation to the appropriate state object (or create a new one if no fit).
+3. Add a row to the `training_features` DDL in `src/tennis_predictor/data/schema.py` and bump the migration check in `_migrate_training_features`.
+4. Update `_TRAINING_FEATURES_COLUMNS` + `_to_insert_row` in `features/build.py`.
+5. Update `compute_features` to read the new state.
+6. Add a leakage test in `tests/test_feature_leakage.py` that mutates a future row and asserts the new field is unchanged.
+7. Run `build_training_features()` end-to-end on the real DB to validate distribution.
