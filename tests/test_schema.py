@@ -257,9 +257,9 @@ def test_training_features_migration_drops_v1_phase3_shape(
             "WHERE table_name = 'training_features'"
         ).fetchall()
     }
-    assert (
-        "days_since_last_match_p1" in cols
-    ), "v1→v2 migration did not run; Phase 3 shape still present"
+    assert "days_since_last_match_p1" in cols, (
+        "v1→v2 migration did not run; Phase 3 shape still present"
+    )
 
 
 def test_ingestion_runs_accepts_well_formed_row(

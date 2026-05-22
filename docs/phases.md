@@ -168,73 +168,70 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 4.1 — Feature expansion  ✅ complete
+## Phase 4.1 — Feature expansion (planned)
 
-**Entry:** Phase 4 exit criteria met. Full design document: `docs/tutorials/phase_4_1_notes.md`. Results write-up: `docs/tutorials/phase_4_1_results.md`.
+**Entry:** Phase 4 exit criteria met. Full design document: `docs/tutorials/phase_4_1_notes.md`.
 
-**Scope rule.** Every Phase 4.1 feature is sourced from data we already fetch automatically (Sackmann cold layer) or derive from the chronological replay. **No hand-curated lookup tables, no manual data entry.** Features that would require manual data work — jet-lag (needs tournament → timezone), altitude (needs tournament → altitude), court pace, playing-style tags — are explicitly deferred.
-
-**Motivation.** Phase 4 LightGBM closed about half the Brier gap to the closing market on each tour. Several low-cost signals are sitting in the cold DB unused (`players.hand` 100% / `dob` ~95% / `height` 25–57% coverage on active players). These are table-stakes features in every public tennis-prediction reference; their absence in v1 is what bounds part of the remaining gap, not the model class.
+**Motivation.** Phase 4 LightGBM closed about half the Brier gap to the closing market on each tour. Several low-cost signals are sitting in the cold DB unused (`players.hand` 100% / `dob` ~95% / `height` 25–57% coverage on active players), plus one static external lookup (tournament geography) unlocks travel context. These are table-stakes features in every public tennis-prediction reference; their absence in v1 is what bounds the gap, not the model class.
 
 **Deliverables:**
-- v2 FeatureVector — 28 v1 fields + **11 new fields** = **39 total**:
+- v2 FeatureVector — 28 v1 fields + **14 new fields** = **42 total**:
   - Handedness match-up (2): `hand_p1`, `hand_p2` (categorical R / L / A / U).
   - Age (4): `age_p1`, `age_p2`, `age_vs_peak_p1`, `age_vs_peak_p2` (peak ATP=26.0, WTA=24.0).
   - Height (3): `height_p1`, `height_p2`, `height_diff_cm`.
-  - Recovery (2): `days_since_last_match_p1`, `days_since_last_match_p2` (capped at 365).
-- New state object `LastMatchState` (lean: tracks one date per player). Persisted to `last_match_state` table at end of `build_training_features`; inference rolls forward from snapshot — same pattern as `EloState`.
+  - Travel jet-lag (4): `tz_shift_hours_{p1,p2}`, `days_since_last_match_{p1,p2}`.
+  - Tournament altitude (1): `altitude_meters`.
+- New static lookup `data/static/tournament_locations.csv` covering tour-level main-draw tournaments active 2018+ (~200 distinct rows). Loaded into a `tournament_locations` DuckDB table by `refresh_data.py`.
+- New state object `TravelState` (mirrors `EloState`): persisted snapshot, rebuilt forward at inference if the requested `as_of_date` precedes the snapshot.
 - Schema migration: `training_features.schema_version` 1 → 2; table drop-and-recreate, full feature rebuild (~5 min on the populated DB).
-- Extended leakage tests: tampered-future-row fixtures assert no `days_since_last_match` or age-derived value for an earlier date changes when a later row is altered.
-- Smoke test extended to populate synthetic `players` rows + the 11 new columns.
+- Extended leakage tests: tampered-future-row fixtures assert no travel/age/etc. feature for an earlier date changes when a later row is altered.
+- Smoke test extended to populate `players` + `tournament_locations` + the 14 new columns.
 - Re-trained 4 production artifacts with the v2 feature set; old Phase 4 artifacts kept until the validation gate clears.
 
-**Exit (all green):**
-- ✅ 4 fresh artifacts on disk (`models/<tour>/<{elo,lightgbm}>/latest/`) with feature count 39 in `metadata.json`.
-- ✅ `players` JOIN coverage in v2 `training_features`: ATP `hand` 99.10% both-known, `dob` 99.5%; WTA `hand` 70.55% both-known (below the design-doc 99% ideal — Sackmann's WTA roster simply lacks `hand` for many pre-2000s entrants; the `U` sentinel preserves the categorical-level discipline so LightGBM consumes it cleanly), `dob` 98.0%. Height coverage 87.9% ATP / 56.5% WTA — no minimum, NaN-as-signal.
-- ✅ All Phase 3 leakage tests + 3 new Phase 4.1 leakage tests pass (15 total; 307-test suite green).
-- ✅ Round-trip serialization tests pass on the 4 new artifacts.
-- ✅ LightGBM post-calibration Brier improves on the WTA tour by ≥0.001 on the most recent 5 walk-forward folds. ATP is essentially flat.
+**Exit:**
+- 4 fresh artifacts on disk (`models/<tour>/<{elo,lightgbm}>/latest/`) with feature count 42 in `metadata.json`.
+- Tournament-locations CSV JOIN covers ≥95% of `training_features` rows with `match_date >= 2018-01-01`.
+- All Phase 3 leakage tests + new Phase 4.1 leakage tests pass.
+- Round-trip serialization tests pass on the new artifacts.
+- LightGBM post-calibration Brier improves on at least one tour by ≥0.001 over Phase 4 on the most recent 5 walk-forward folds. The per-tour delta is documented in `docs/tutorials/phase_4_1_results.md` either way — if neither tour improves, the phase ends with a roll-back and a documented null result.
 
-**Headline numbers (last 5 folds, post-calibration, sample-weighted Brier):**
-- ATP LightGBM: 0.2105 → 0.2101 (Δ −0.0004 — below the 0.001 ship gate but not worse).
-- WTA LightGBM: 0.2026 → 0.1954 (Δ −0.0072 — clears gate by 7×).
-- Elo baselines unchanged (feature set is irrelevant for the rating-based predictor).
-
-**Implementation notes (post-design):**
-- v2 FeatureVector: 28 v1 + 9 player-metadata (hand_p1/p2, age_p1/p2, age_vs_peak_p1/p2, height_p1/p2, height_diff_cm) + 2 recovery (days_since_last_match_p1/p2) = **39 fields**. Age/height retain no Pydantic bounds — Sackmann's DOB column has a handful of obviously wrong values (e.g. a player listed as 3 years old at a tour-level match); LightGBM handles outliers cleanly. Categorical bounds on `Hand` are still enforced.
-- New `last_match_state` table mirrors `elo_state`'s persistence pattern. `LastMatchState` lives in `src/tennis_predictor/features/last_match.py`; 365-day cap per design default #4.
-- Player metadata is JOINed pre-replay via `PlayerMetadataLookup.from_db(conn)` — read once, query in-memory many times. Same pattern as `RankingLookup`.
-- `_migrate_training_features` extended to detect the v1 → v2 shape transition: v1 had `tournament_level` but no `days_since_last_match_p1`, so the sentinel-column check is enough. `scripts/build_features.py` is always re-run after a feature change.
-- `CATEGORICAL_COLUMNS` grew to `("tournament_level", "surface", "hand_p1", "hand_p2")` with `hand_*` levels `("R", "L", "A", "U")`.
-- `build_training_features` now calls `db_schema.create_all_tables(conn)` first so the migration runs even when the orchestrator opens the DB outside of `open_connection`.
-- Wall-time: build 421 s (~1 min slower than v1 due to the players JOIN and LastMatchState bookkeeping); train 60 s for all four artifacts.
-- Phase 4 v1 artifacts preserved at `models/<tour>/<{elo,lightgbm}>/20260521-1026/` for reference but no longer pointed at by `latest`.
-
-**Out of scope (explicit):**
-- Jet-lag / timezone shift (would need manual tournament-location CSV).
-- Tournament altitude (same constraint).
-- Court Pace Index (no public source).
+**Out of scope (decided up front):**
+- Court Pace Index (no public source; serve/return rolling features already capture surface-speed signal).
+- Per-player altitude adaptation (literature support too thin to justify the feature count).
 - Playing-style tags (defender/attacker) — derivable from existing stats, no new signal.
 
 ---
 
 ## Phase 5 — LLM agent
 
-**Entry:** Phase 4.1 exit criteria met.
+**Entry:** Phase 4.1 exit criteria met. Full design document: `docs/tutorials/phase_5_notes.md`.
+
+**Architectural contract** (locked in `CLAUDE.md` before implementation; see sections "Anthropic SDK", "Web search", "Structured output discipline", "LLM agent failure modes", "Testing the LLM agent", "Budget discipline"):
+- Direct `anthropic` SDK only — no LangChain / LiteLLM / OpenRouter / Managed Agents.
+- Sonnet 4.6 default (`ANTHROPIC_MODEL`); not Opus (cost), not Haiku (synthesis).
+- Tool-use pattern for structured output: single `submit_analysis` tool with `additionalProperties: false`; hybrid `tool_choice` (auto → forced on final iteration).
+- One `cache_control` marker on the last tool definition; system prompt + tool defs are byte-stable.
+- Web search: native `web_search`, no `allowed_domains`, small `blocked_domains` (betting sites), preferred sources noted in system prompt (ESPN / BBC / tennis.com / tennis365.com).
+- `AgentBudget` with four hard limits per call (6 tool iterations, 30k tokens, 120 s wall clock, 3 web searches). Org-level $20/month cap in Anthropic console as the final wall.
+- New hard rule #10: `get_model_prediction` is mandatory; agent never invoked without it.
 
 **Deliverables:**
-- `LLMClient` abstract base with Anthropic implementation; prompt caching enabled (system prompt and tool definitions as cacheable blocks).
+- `LLMClient` abstract base + `AnthropicLLMClient` implementation in `src/tennis_predictor/llm/client.py`. Prompt caching, byte-stability test, every call logged to `llm_traces`.
 - Tools wired up with Pydantic input/output schemas:
   - `get_model_prediction` — the **only** source of the win probability shown to the user.
   - `get_player_stats`, `get_head_to_head`, `get_recent_form`, `get_player_ranking` — DuckDB-backed.
-  - `search_tennis_news` — Claude's native `web_search`, first-class tool. For each prediction the agent is expected to query for **withdrawals, injuries, and personal events affecting either player in the last ~14 days**. This is the user-facing differentiator of the product: news the user might otherwise miss.
-- `AgentResponse` Pydantic model (no LLM-emitted probability allowed).
-- `llm_traces` table populated by every call.
-- Tests: tool schemas validate, structured output schema rejects banned fields, end-to-end agent call against a recorded fixture, second invocation shows non-zero cache stats.
+  - `web_search` — Anthropic's native, with `max_uses=3`, `blocked_domains` list, 14-day recency enforced via system prompt.
+  - `submit_analysis` — structured-output collector mirroring `AgentResponse`.
+- `TennisAgent.predict(match_context) -> AgentResponse` orchestrator with `AgentBudget` enforcement and 120 s `asyncio.timeout` wrap.
+- `AgentResponse` Pydantic model (no LLM-emitted probability allowed; schema rejects any `probability`-like field via `additionalProperties: false`).
+- `llm_traces` schema migration: add `web_search_count INTEGER` + `estimated_cost_usd DOUBLE` columns. `ALTER TABLE ADD COLUMN` (DuckDB-native, preserves existing rows).
+- Three-tier test suite: unit tests (mocked Anthropic, run in CI), recorded-fixture e2e tests in `tests/fixtures/llm/` (run in CI), live-API tests under `@pytest.mark.llm_live` (run locally only).
+- CLI: `uv run python scripts/predict_match.py --match-id <id>` produces a valid `AgentResponse`, prints it, writes to `llm_traces`.
 
 **Exit:**
-- A single CLI command runs the agent against a sample upcoming match and produces a valid `AgentResponse` whose `key_factors` and `caveats` reflect news the tool actually surfaced.
-- `llm_traces` row exists for that call with non-zero cache stats on the second invocation.
+- CLI runs end-to-end on a sample upcoming match, produces valid `AgentResponse` with `key_factors` / `caveats` reflecting real news (or "no recent news surfaced" — both acceptable).
+- `llm_traces` row exists for that call with non-zero `cache_read_tokens` on the second invocation within 5 minutes.
+- All quality gates green; live-API smoke test passes locally.
 
 ---
 

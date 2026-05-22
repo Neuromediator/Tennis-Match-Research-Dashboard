@@ -117,9 +117,9 @@ def test_feature_vector_family_breakdown() -> None:
     for name in FEATURE_FIELD_NAMES:
         counts[classify(name)] += 1
 
-    assert (
-        counts == expected_by_family
-    ), f"Family counts drifted from contract: {counts} != {expected_by_family}"
+    assert counts == expected_by_family, (
+        f"Family counts drifted from contract: {counts} != {expected_by_family}"
+    )
 
 
 # ---------------------------------------------------------------------------

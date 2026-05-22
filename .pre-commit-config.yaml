@@ -1,6 +1,9 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.0
+    # Pinned to match the version uv installs (see uv.lock). Drift between
+    # pre-commit and `uv run ruff` causes flapping reformat loops — e.g.
+    # v0.7.0's "assert (cond), msg" vs v0.15.x's "assert cond, (msg)".
+    rev: v0.15.13
     hooks:
       - id: ruff
         args: [--fix]
