@@ -1,0 +1,64 @@
+{
+  "description": "Happy path: agent calls get_player_stats + web_search then submits.",
+  "responses": [
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 200,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2000
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Looking up stats for Alcaraz first."
+        },
+        {
+          "type": "tool_use",
+          "id": "stats_1",
+          "name": "get_player_stats",
+          "input": {
+            "player_name": "Carlos Alcaraz",
+            "tour": "ATP",
+            "as_of_date": "2026-06-08"
+          }
+        },
+        {
+          "type": "server_tool_use",
+          "id": "ws_1",
+          "name": "web_search",
+          "input": {
+            "query": "Alcaraz Sinner Roland Garros 2026 form injury"
+          }
+        }
+      ]
+    },
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 200,
+        "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 0
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "submit_1",
+          "name": "submit_analysis",
+          "input": {
+            "key_factors": [
+              "Surface-Elo edge for Alcaraz on clay",
+              "Alcaraz won the most recent meeting on clay 6-4 6-3"
+            ],
+            "narrative": "Alcaraz holds a clear surface advantage and beat Sinner in their last clay meeting at Madrid 2024. Sinner's hard-court win at Indian Wells flips on clay where Alcaraz's career numbers are strongest. The model probability around 0.62 lines up with this read.",
+            "confidence_band": "medium",
+            "caveats": ["no recent news surfaced"],
+            "tools_used": ["get_model_prediction", "get_player_stats", "web_search"]
+          }
+        }
+      ]
+    }
+  ]
+}

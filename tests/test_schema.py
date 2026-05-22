@@ -262,6 +262,60 @@ def test_training_features_migration_drops_v1_phase3_shape(
     )
 
 
+def test_llm_traces_has_phase5_columns(fresh_db: duckdb.DuckDBPyConnection) -> None:
+    """Phase 5 added `web_search_count` and `estimated_cost_usd` to llm_traces."""
+    schema.create_all_tables(fresh_db)
+    cols = {
+        row[0]
+        for row in fresh_db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'llm_traces'"
+        ).fetchall()
+    }
+    assert {"web_search_count", "estimated_cost_usd"} <= cols
+
+
+def test_llm_traces_migration_adds_phase5_columns_to_legacy_table(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Pre-Phase-5 llm_traces shape must be migrated in place, preserving rows."""
+    fresh_db.execute(schema.LLM_TRACES_SEQUENCE_DDL)
+    fresh_db.execute(
+        """
+        CREATE TABLE llm_traces (
+            trace_id               BIGINT PRIMARY KEY DEFAULT nextval('seq_llm_traces'),
+            ts                     TIMESTAMP NOT NULL,
+            model                  VARCHAR NOT NULL,
+            system_prompt_hash     VARCHAR,
+            input_messages         JSON,
+            tool_calls             JSON,
+            output                 JSON,
+            tokens_in              INTEGER,
+            tokens_out             INTEGER,
+            cache_read_tokens      INTEGER,
+            cache_creation_tokens  INTEGER,
+            latency_ms             INTEGER,
+            error                  VARCHAR
+        )
+        """
+    )
+    fresh_db.execute("INSERT INTO llm_traces (ts, model) VALUES (CURRENT_TIMESTAMP, 'legacy-row')")
+
+    schema.create_all_tables(fresh_db)
+
+    cols = {
+        row[0]
+        for row in fresh_db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'llm_traces'"
+        ).fetchall()
+    }
+    assert {"web_search_count", "estimated_cost_usd"} <= cols
+
+    row = fresh_db.execute(
+        "SELECT model, web_search_count, estimated_cost_usd FROM llm_traces"
+    ).fetchone()
+    assert row == ("legacy-row", None, None)
+
+
 def test_ingestion_runs_accepts_well_formed_row(
     fresh_db: duckdb.DuckDBPyConnection,
 ) -> None:

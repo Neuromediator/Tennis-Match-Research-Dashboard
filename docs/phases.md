@@ -168,7 +168,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 4.1 — Feature expansion (planned)
+## Phase 4.1 — Feature expansion (complete)
 
 **Entry:** Phase 4 exit criteria met. Full design document: `docs/tutorials/phase_4_1_notes.md`.
 
@@ -202,9 +202,9 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 5 — LLM agent
+## Phase 5 — LLM agent  ✅ complete
 
-**Entry:** Phase 4.1 exit criteria met. Full design document: `docs/tutorials/phase_5_notes.md`.
+**Entry:** Phase 4.1 exit criteria met. Full design document: `docs/tutorials/phase_5_notes.md`. Results: `docs/tutorials/phase_5_results.md`.
 
 **Architectural contract** (locked in `CLAUDE.md` before implementation; see sections "Anthropic SDK", "Web search", "Structured output discipline", "LLM agent failure modes", "Testing the LLM agent", "Budget discipline"):
 - Direct `anthropic` SDK only — no LangChain / LiteLLM / OpenRouter / Managed Agents.
@@ -228,10 +228,17 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 - Three-tier test suite: unit tests (mocked Anthropic, run in CI), recorded-fixture e2e tests in `tests/fixtures/llm/` (run in CI), live-API tests under `@pytest.mark.llm_live` (run locally only).
 - CLI: `uv run python scripts/predict_match.py --match-id <id>` produces a valid `AgentResponse`, prints it, writes to `llm_traces`.
 
-**Exit:**
-- CLI runs end-to-end on a sample upcoming match, produces valid `AgentResponse` with `key_factors` / `caveats` reflecting real news (or "no recent news surfaced" — both acceptable).
-- `llm_traces` row exists for that call with non-zero `cache_read_tokens` on the second invocation within 5 minutes.
-- All quality gates green; live-API smoke test passes locally.
+**Exit (all green):**
+- ✅ CLI runs end-to-end on a sample upcoming match, produces valid `AgentResponse` with `key_factors` / `caveats` reflecting real news (or "no recent news surfaced" — both acceptable). Live smoke surfaced an Alcaraz wrist-injury Roland Garros withdrawal that the trained model could not see.
+- ✅ `llm_traces` row exists for that call with non-zero `cache_read_tokens` on the second invocation within 5 minutes (observed `cache_read_tokens = 4 719` on the second prediction).
+- ✅ All quality gates green; live-API smoke test passes locally.
+
+**Headline numbers (live smoke 2026-05-22):**
+- 365 default tests + 2 live tests, all passing.
+- End-to-end cost per prediction: **~$0.10** (vs the $0.03 pre-implementation estimate — the gap is web_search response payloads showing up as `cache_creation_input_tokens` on the next turn).
+- Wall-clock per prediction: ~36-38 s for a 2-3 turn loop.
+- Per-call `AgentBudget` accounting refined post-smoke: `tokens_used` now counts `tokens_in + tokens_out + cache_creation` (cost-weighted subset), excluding the heavily-discounted `cache_read`. Numeric limits unchanged.
+- Org-level $20/month cap remains comfortably above expected 5-10/day personal-use load.
 
 ---
 

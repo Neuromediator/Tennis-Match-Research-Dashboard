@@ -129,6 +129,11 @@ CREATE TABLE IF NOT EXISTS market_implied_probabilities (
 
 LLM_TRACES_SEQUENCE_DDL = "CREATE SEQUENCE IF NOT EXISTS seq_llm_traces START 1;"
 
+# Phase 5: `web_search_count` and `estimated_cost_usd` are added so the
+# Streamlit dashboard (Phase 6) can surface "spent today / this month" and
+# cache-hit hygiene without re-deriving from token counts. The migration
+# below ALTERs an existing table to add the columns when they're missing
+# (DuckDB ALTER TABLE ADD COLUMN preserves existing rows).
 LLM_TRACES_DDL = """
 CREATE TABLE IF NOT EXISTS llm_traces (
     trace_id               BIGINT PRIMARY KEY DEFAULT nextval('seq_llm_traces'),
@@ -143,7 +148,9 @@ CREATE TABLE IF NOT EXISTS llm_traces (
     cache_read_tokens      INTEGER,
     cache_creation_tokens  INTEGER,
     latency_ms             INTEGER,
-    error                  VARCHAR
+    error                  VARCHAR,
+    web_search_count       INTEGER,
+    estimated_cost_usd     DOUBLE
 );
 """
 
@@ -422,9 +429,48 @@ def _migrate_training_features(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute("DROP TABLE training_features")
 
 
+# Phase 5 columns added to `llm_traces`. Listed as (column_name, DDL_type)
+# tuples so the migration helper can ALTER an existing table without doing
+# a full drop-and-recreate (the table accumulates user-visible history).
+_LLM_TRACES_PHASE5_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("web_search_count", "INTEGER"),
+    ("estimated_cost_usd", "DOUBLE"),
+)
+
+
+def _migrate_llm_traces(conn: duckdb.DuckDBPyConnection) -> None:
+    """Idempotent migration of `llm_traces` to the Phase 5 shape.
+
+    Adds `web_search_count` and `estimated_cost_usd` to a pre-existing
+    `llm_traces` table when they're missing. Existing rows survive with
+    NULLs in the new columns (back-fill is unnecessary — Phase 4 and
+    earlier never logged web-search counts or estimated cost). No-op on a
+    fresh DB; `CREATE TABLE IF NOT EXISTS` then materialises the up-to-date
+    layout.
+    """
+    table_exists = (
+        conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'llm_traces'"
+        ).fetchone()
+        is not None
+    )
+    if not table_exists:
+        return
+    existing_cols = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'llm_traces'"
+        ).fetchall()
+    }
+    for col_name, col_type in _LLM_TRACES_PHASE5_COLUMNS:
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE llm_traces ADD COLUMN {col_name} {col_type}")
+
+
 def create_all_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every table and index. Idempotent."""
     _migrate_training_features(conn)
+    _migrate_llm_traces(conn)
     for ddl in TABLE_DDL:
         conn.execute(ddl)
     for idx in INDEXES:

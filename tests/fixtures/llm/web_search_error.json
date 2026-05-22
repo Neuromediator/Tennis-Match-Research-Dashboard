@@ -1,0 +1,59 @@
+{
+  "description": "Degraded path: web_search returns an error block, agent surfaces 'news lookup unavailable' in caveats.",
+  "responses": [
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 200,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2000
+      },
+      "content": [
+        {
+          "type": "server_tool_use",
+          "id": "ws_1",
+          "name": "web_search",
+          "input": {"query": "Alcaraz Sinner news 2026"}
+        },
+        {
+          "type": "web_search_tool_result",
+          "tool_use_id": "ws_1",
+          "content": {
+            "type": "web_search_tool_result_error",
+            "error_code": "unavailable"
+          }
+        }
+      ]
+    },
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 100,
+        "output_tokens": 200,
+        "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 0
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "submit_2",
+          "name": "submit_analysis",
+          "input": {
+            "key_factors": [
+              "Model has surface-Elo signal even without news",
+              "Recent H2H shows back-and-forth on different surfaces"
+            ],
+            "narrative": "Without recent news, the model's surface and form signals are the only inputs. Surface-Elo favours Alcaraz on clay; the H2H is competitive but Alcaraz holds the edge on this surface specifically. Treat the probability as a model-only read.",
+            "confidence_band": "low",
+            "caveats": [
+              "news lookup unavailable",
+              "no recent news surfaced"
+            ],
+            "tools_used": ["get_model_prediction", "web_search"]
+          }
+        }
+      ]
+    }
+  ]
+}

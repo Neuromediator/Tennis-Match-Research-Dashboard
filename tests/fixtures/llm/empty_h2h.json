@@ -1,0 +1,56 @@
+{
+  "description": "Edge case: get_head_to_head returns zero matches; agent interprets as 'fresh pairing' signal.",
+  "responses": [
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 200,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2000
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "h2h_1",
+          "name": "get_head_to_head",
+          "input": {
+            "player_a_name": "Carlos Alcaraz",
+            "player_b_name": "Jannik Sinner",
+            "tour": "ATP",
+            "as_of_date": "2026-06-08"
+          }
+        }
+      ]
+    },
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 120,
+        "output_tokens": 220,
+        "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 0
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "submit_3",
+          "name": "submit_analysis",
+          "input": {
+            "key_factors": [
+              "No prior meetings between these two players",
+              "Model leans on surface-Elo and recent form as primary signals"
+            ],
+            "narrative": "The two players have not previously met on tour, so the prediction rests entirely on surface-Elo, recent form, and ranking signals. Treat the probability as a fresh-pairing read with no head-to-head anchor.",
+            "confidence_band": "low",
+            "caveats": [
+              "no head-to-head history available",
+              "no recent news surfaced"
+            ],
+            "tools_used": ["get_model_prediction", "get_head_to_head"]
+          }
+        }
+      ]
+    }
+  ]
+}
