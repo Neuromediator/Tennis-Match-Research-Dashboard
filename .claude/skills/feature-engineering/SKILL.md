@@ -64,9 +64,9 @@ A Pydantic model in `src/tennis_predictor/features/schema.py`. Fields are typed 
 
 Why Pydantic, not `dict`: training and inference run on different code paths months apart. Schema drift between them is the single most common silent bug in ML pipelines. A typed contract catches it at construction time.
 
-## Feature families (v1) — final list
+## Feature families — v2 (Phase 4.1)
 
-`FeatureVector` has **28 fields** organized into seven conceptual families. Counts in parentheses are field counts in that family. LightGBM consumes the flat vector; the families are for our mental model and feature-importance grouping.
+`FeatureVector` has **39 fields** in v2 (28 v1 fields + 11 added in Phase 4.1) organized into eleven conceptual families. Counts in parentheses are field counts in that family. LightGBM consumes the flat vector; the families are for our mental model and feature-importance grouping.
 
 | # | Family (count) | Fields |
 |---|---|---|
@@ -77,8 +77,14 @@ Why Pydantic, not `dict`: training and inference run on different code paths mon
 | Fatigue (4) | `fatigue_matches_7d_p1/p2`, `fatigue_sets_14d_p1/p2` |
 | Ranking (3) | `rank_p1`, `rank_p2`, `rank_diff` |
 | Tournament context (3) | `tournament_level` (cat), `best_of` (3 or 5), `surface` (cat) |
+| Handedness (2) — *Phase 4.1* | `hand_p1` (cat R/L/A/U), `hand_p2` (cat R/L/A/U) |
+| Age (4) — *Phase 4.1* | `age_p1/p2` (years), `age_vs_peak_p1/p2` (signed years from `PEAK_AGE[tour]`: ATP=26, WTA=24) |
+| Height (3) — *Phase 4.1* | `height_p1/p2` (cm), `height_diff_cm` |
+| Recovery (2) — *Phase 4.1* | `days_since_last_match_p1/p2` (capped at 365) |
 
-26 numeric + 2 categorical fields (`tournament_level`, `surface`). LightGBM handles categoricals natively — no one-hot encoding.
+35 numeric + 4 categorical fields (`tournament_level`, `surface`, `hand_p1`, `hand_p2`). LightGBM handles categoricals natively — no one-hot encoding. Hand categories are declared in `models.feature_spec.HAND_CATEGORIES = ("R", "L", "A", "U")`.
+
+The module-level `SCHEMA_VERSION` in `features/schema.py` is `2`. The `training_features` table writes `schema_version` per row; the migration in `_migrate_training_features` detects v1→v2 via the `days_since_last_match_p1` sentinel column and drops the v1 table so the v2 DDL takes over.
 
 ### Choices in serve/return that aren't obvious
 
@@ -138,24 +144,31 @@ The ATP 500 list is hand-curated in `features.tournament_level.ATP_500_TOURNAMEN
 ## State storage
 
 - `elo_state` is persisted to DuckDB after each `build_training_features` run; inference reads it and rolls forward (or rebuilds from scratch if `as_of_date <= snapshot_date`).
+- `last_match_state` (Phase 4.1) persisted alongside `elo_state` via `LastMatchState.save_to_db`; same baseline-date discipline in inference — load + roll forward when `as_of_date > snapshot_date`, else rebuild from scratch.
 - Other state objects (`RollingForm`, `H2H`, `Fatigue`, `ServeReturn`) are rebuilt in-memory each training run (cheap on our data volume); not persisted.
 - `RankingLookup` is rebuilt on demand from the `rankings` table; ~5.6M rows fit in memory as parallel `{player_id: [dates], [ranks]}` arrays with O(log N) bisect.
+- `PlayerMetadataLookup` (Phase 4.1) is built once via `from_db(conn)` at the start of `build_training_features` / `compute_features` — pure JOIN against `players` for `hand` / `dob` / `height`. Static data, so no leakage and no state object.
 
 ## NaN policy in the FeatureVector
 
-Required (never None): Elo (3), H2H wins (2), fatigue (4), ranking (3, with `9999` sentinel for unranked), tournament context (3).
+Required (never None): Elo (3), H2H wins (2), fatigue (4), ranking (3, with `9999` sentinel for unranked), tournament context (3), handedness (2 — default `"U"` when missing).
 
 Optional (None allowed):
 - Recent form (4): None when window has < 3 matches.
 - Serve/return (8): None when surface-filtered window has < 5 matches with non-null stat columns (~58% of pre-1990s `main` matches have NULL serve stats in Sackmann).
 - `h2h_recency_days`: None when the pair has never met.
+- Age (4): None when `players.dob` is missing. No Pydantic bounds — Sackmann has a few obviously wrong DOBs (e.g. player listed as 3 yo at a tour-level match); LightGBM handles outliers cleanly.
+- Height (3): None when `players.height` is missing. ATP ~88% coverage on training rows, WTA ~57%. No bounds.
+- Recovery (2): None when the player has no prior completed match. Capped at 365 days (`LastMatchState.CAP_DAYS`) — beyond a year the semantics flip from "recovery" to "returning from long absence".
 
 ## When you add a feature
 
-1. Add the field to `FeatureVector` with type and bounds.
-2. Add the computation to the appropriate state object (or create a new one if no fit).
-3. Add a row to the `training_features` DDL in `src/tennis_predictor/data/schema.py` and bump the migration check in `_migrate_training_features`.
+1. Add the field to `FeatureVector` with type and bounds in `features/schema.py`. Bump `SCHEMA_VERSION`.
+2. Add the computation to the appropriate state object (or create a new one if no fit). For player-static fields (no time dependency), add to `PlayerMetadataLookup` instead of a state object.
+3. Add a row to the `training_features` DDL in `src/tennis_predictor/data/schema.py`. Extend `_migrate_training_features` with a sentinel-column check for the new schema version so the next `create_all_tables` call drops the stale table.
 4. Update `_TRAINING_FEATURES_COLUMNS` + `_to_insert_row` in `features/build.py`.
 5. Update `compute_features` to read the new state.
-6. Add a leakage test in `tests/test_feature_leakage.py` that mutates a future row and asserts the new field is unchanged.
-7. Run `build_training_features()` end-to-end on the real DB to validate distribution.
+6. Add a leakage test in `tests/test_feature_leakage.py` that mutates a future row and asserts the new field is unchanged. For static `players` JOIN fields, also add a sanity test that they don't drift under future-match mutations.
+7. Update `CATEGORICAL_COLUMNS` + `CATEGORY_VALUES` in `models/feature_spec.py` if the new field is categorical.
+8. Extend `tests/test_train_models_smoke.py` synthetic features + `players` seed so the smoke test still produces a deterministic round-trip fixture.
+9. Run `build_training_features()` end-to-end on the real DB to validate distribution.

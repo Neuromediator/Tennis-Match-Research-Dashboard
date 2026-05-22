@@ -55,9 +55,17 @@ from datetime import date
 
 import duckdb
 
+from tennis_predictor.data import schema as db_schema
 from tennis_predictor.features.elo import EloState
 from tennis_predictor.features.fatigue import FatigueState, count_sets
 from tennis_predictor.features.h2h import H2HState
+from tennis_predictor.features.last_match import LastMatchState
+from tennis_predictor.features.player_metadata import (
+    PlayerMetadataLookup,
+    compute_age,
+    compute_age_vs_peak,
+    compute_height_diff,
+)
 from tennis_predictor.features.ranking import RankingLookup
 from tennis_predictor.features.rolling_form import RollingFormState
 from tennis_predictor.features.schema import FeatureVector
@@ -133,6 +141,18 @@ _TRAINING_FEATURES_COLUMNS: tuple[str, ...] = (
     "tournament_level",
     "best_of",
     "surface",
+    # Phase 4.1 v2 columns — order matches FeatureVector field order
+    "hand_p1",
+    "hand_p2",
+    "age_p1",
+    "age_p2",
+    "age_vs_peak_p1",
+    "age_vs_peak_p2",
+    "height_p1",
+    "height_p2",
+    "height_diff_cm",
+    "days_since_last_match_p1",
+    "days_since_last_match_p2",
 )
 
 _INSERT_SQL = (
@@ -195,14 +215,22 @@ class BuildSummary:
 
 def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
     """Run the full chronological replay → populate `training_features` and
-    persist `elo_state`. Returns counters for visibility into how many rows
-    landed where."""
+    persist `elo_state` + `last_match_state`. Returns counters for visibility
+    into how many rows landed where.
+
+    Calls `create_all_tables` first so the schema migration runs (Phase 3
+    placeholder → v1, Phase 3 v1 → Phase 4.1 v2). Idempotent on an
+    already-migrated DB."""
+    db_schema.create_all_tables(conn)
+
     ranking_lookup = RankingLookup.from_db(conn)
+    player_metadata = PlayerMetadataLookup.from_db(conn)
     elo = EloState()
     form = RollingFormState()
     h2h = H2HState()
     fatigue = FatigueState()
     serve_return = ServeReturnState()
+    last_match = LastMatchState()
     summary = BuildSummary()
 
     conn.execute("BEGIN TRANSACTION")
@@ -261,6 +289,7 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
                 p1, p2 = sorted([m.winner_id, m.loser_id])
                 label = 1 if m.winner_id == p1 else 0
                 fv = _build_feature_vector(
+                    tour=m.tour,
                     p1=p1,
                     p2=p2,
                     surface=surface,
@@ -272,7 +301,9 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
                     h2h=h2h,
                     fatigue=fatigue,
                     serve_return=serve_return,
+                    last_match=last_match,
                     ranking_lookup=ranking_lookup,
+                    player_metadata=player_metadata,
                 )
                 batch.append(_to_insert_row(m.match_id, m.tour, m.match_date, p1, p2, label, fv))
                 summary.training_rows_written += 1
@@ -288,6 +319,8 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
             h2h.update(m.winner_id, m.loser_id, m.match_date)
             fatigue.update(m.winner_id, m.loser_id, sets_played, m.match_date)
             serve_return.update(m.winner_id, m.loser_id, surface, m.match_date, m.stats)
+            last_match.update(m.winner_id, m.match_date)
+            last_match.update(m.loser_id, m.match_date)
             summary.state_updates_applied += 1
 
         if batch:
@@ -298,6 +331,7 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
         raise
 
     elo.save_to_db(conn)
+    last_match.save_to_db(conn)
 
     logger.info(
         "build_training_features done: scanned=%d, updates=%d, training_rows=%d, "
@@ -421,6 +455,7 @@ def _row_to_match(row: tuple) -> _MatchRow:
 
 def _build_feature_vector(
     *,
+    tour: str,
     p1: str,
     p2: str,
     surface: str,
@@ -432,7 +467,9 @@ def _build_feature_vector(
     h2h: H2HState,
     fatigue: FatigueState,
     serve_return: ServeReturnState,
+    last_match: LastMatchState,
     ranking_lookup: RankingLookup,
+    player_metadata: PlayerMetadataLookup,
 ) -> FeatureVector:
     """Snapshot every state object and assemble one FeatureVector.
 
@@ -456,6 +493,14 @@ def _build_feature_vector(
 
     sr1 = serve_return.snapshot(p1, surface)
     sr2 = serve_return.snapshot(p2, surface)
+
+    meta_p1 = player_metadata.get(p1)
+    meta_p2 = player_metadata.get(p2)
+    age_p1 = compute_age(meta_p1.dob, match_date)
+    age_p2 = compute_age(meta_p2.dob, match_date)
+
+    days_since_p1 = last_match.days_since(p1, match_date)
+    days_since_p2 = last_match.days_since(p2, match_date)
 
     return FeatureVector.model_validate(
         {
@@ -487,6 +532,17 @@ def _build_feature_vector(
             "tournament_level": tournament_level,
             "best_of": best_of,
             "surface": surface,
+            "hand_p1": meta_p1.hand,
+            "hand_p2": meta_p2.hand,
+            "age_p1": age_p1,
+            "age_p2": age_p2,
+            "age_vs_peak_p1": compute_age_vs_peak(age_p1, tour),
+            "age_vs_peak_p2": compute_age_vs_peak(age_p2, tour),
+            "height_p1": meta_p1.height,
+            "height_p2": meta_p2.height,
+            "height_diff_cm": compute_height_diff(meta_p1.height, meta_p2.height),
+            "days_since_last_match_p1": days_since_p1,
+            "days_since_last_match_p2": days_since_p2,
         }
     )
 
@@ -535,4 +591,16 @@ def _to_insert_row(
         fv.tournament_level,
         fv.best_of,
         fv.surface,
+        # Phase 4.1 v2 columns
+        fv.hand_p1,
+        fv.hand_p2,
+        fv.age_p1,
+        fv.age_p2,
+        fv.age_vs_peak_p1,
+        fv.age_vs_peak_p2,
+        fv.height_p1,
+        fv.height_p2,
+        fv.height_diff_cm,
+        fv.days_since_last_match_p1,
+        fv.days_since_last_match_p2,
     )

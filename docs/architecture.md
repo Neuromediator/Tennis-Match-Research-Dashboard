@@ -19,18 +19,19 @@ A single-process Python application with five logical layers. No microservices. 
            │                                 │
 ┌──────────▼──────────────┐    ┌─────────────▼──────────────────────┐
 │ Modeling layer          │    │ Feature engineering layer          │
-│   - Six models          │    │   - build_training_features()      │
-│     (3 types × 2 tours) │    │     (chronological replay + state) │
-│   - Walk-forward CV     │    │   - compute_features(...)          │
-│   - Isotonic / Platt    │    │     (inference, returns            │
-│   - Market benchmark    │    │     FeatureVector)                 │
+│   - Four models         │    │   - build_training_features()      │
+│     (2 types × 2 tours: │    │     (chronological replay + state) │
+│     Elo / LightGBM)     │    │   - compute_features(...)          │
+│   - Walk-forward CV     │    │     (inference, returns            │
+│   - Isotonic / Platt    │    │     FeatureVector v2 — 39 fields)  │
+│   - Market benchmark    │    │                                    │
 └──────────┬──────────────┘    └─────────────┬──────────────────────┘
            │                                 │
 ┌──────────▼─────────────────────────────────▼──────────────────────┐
 │ Data layer (DuckDB, single file)                                  │
 │   matches, scheduled_matches, players, rankings, player_aliases,  │
-│   market_implied_probabilities, elo_state, training_features,     │
-│   llm_traces, ingestion_runs                                      │
+│   market_implied_probabilities, elo_state, last_match_state,      │
+│   training_features, llm_traces, ingestion_runs                   │
 └───────────────────────────────────────────────────────────────────┘
 ```
 

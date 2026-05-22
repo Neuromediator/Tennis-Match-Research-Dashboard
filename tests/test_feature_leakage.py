@@ -21,8 +21,15 @@ data:
 | FatigueState   | change score string of future match   | fatigue_matches/sets        |
 | RankingLookup  | insert a future ranking row           | rank_p1/p2, rank_diff       |
 | ServeReturn    | change w_* stats of future match      | first/second/bp_*           |
+| LastMatchState | swap winner / insert future match     | days_since_last_match_*     |
 | ALL            | insert a brand new future match       | should not change anything  |
 | ALL            | delete a future match                 | should not change anything  |
+
+Phase 4.1 player-metadata fields (`hand_*`, `age_*`, `height_*`) come from
+a static `players` JOIN and don't depend on future-match data — they
+cannot leak by construction. They're covered indirectly by the
+'baseline has nontrivial values' assertion: if a bug ever moved them onto
+a future-reading path, they'd show drift in the existing tamper tests.
 """
 
 from __future__ import annotations
@@ -44,22 +51,24 @@ from tennis_predictor.features.schema import FEATURE_FIELD_NAMES
 
 
 @pytest.mark.leakage
-def test_feature_vector_has_exactly_28_fields() -> None:
+def test_feature_vector_has_exactly_39_fields() -> None:
     """Guards against silent additions/removals diverging from
     `.claude/skills/feature-engineering/SKILL.md` and `docs/phases.md`.
+    Phase 4.1 bumped v1's 28 fields to v2's 39 (v1 + 11 metadata/recovery).
     """
-    assert len(FeatureVector.model_fields) == 28, (
-        f"FeatureVector must have 28 fields (see feature-engineering skill); "
+    assert len(FeatureVector.model_fields) == 39, (
+        f"FeatureVector must have 39 fields (Phase 4.1 v2 — see feature-engineering skill); "
         f"got {len(FeatureVector.model_fields)}"
     )
 
 
 @pytest.mark.leakage
 def test_feature_vector_family_breakdown() -> None:
-    """The seven families must contain the documented counts.
+    """The nine families must contain the documented counts.
 
     Catches accidental renames that would silently break downstream
-    feature-importance grouping.
+    feature-importance grouping. Phase 4.1 added three families:
+    handedness (2), age (4), height (3), recovery (2).
     """
     expected_by_family = {
         "elo": 3,
@@ -69,6 +78,10 @@ def test_feature_vector_family_breakdown() -> None:
         "fatigue": 4,
         "rank": 3,
         "tournament_context": 3,
+        "handedness": 2,
+        "age": 4,
+        "height": 3,
+        "recovery": 2,
     }
 
     def classify(name: str) -> str:
@@ -90,6 +103,14 @@ def test_feature_vector_family_breakdown() -> None:
             return "rank"
         if name in {"tournament_level", "best_of", "surface"}:
             return "tournament_context"
+        if name.startswith("hand_"):
+            return "handedness"
+        if name.startswith("age_"):
+            return "age"
+        if name.startswith("height_"):
+            return "height"
+        if name.startswith("days_since_last_match_"):
+            return "recovery"
         raise AssertionError(f"Unclassified FeatureVector field: {name}")
 
     counts: dict[str, int] = dict.fromkeys(expected_by_family, 0)
@@ -199,6 +220,24 @@ def _insert_ranking(
     )
 
 
+def _insert_player(
+    conn: duckdb.DuckDBPyConnection,
+    player_id: str,
+    *,
+    hand: str | None,
+    dob: date | None,
+    height: int | None,
+) -> None:
+    """Insert a Phase 4.1 player-metadata row used by the PlayerMetadataLookup
+    JOIN inside `compute_features`. `sackmann_id` is NOT NULL but not
+    unique, so a static value is fine for fixture purposes."""
+    conn.execute(
+        "INSERT INTO players (player_id, tour, sackmann_id, hand, dob, height) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [player_id, "ATP", 0, hand, dob, height],
+    )
+
+
 @pytest.fixture
 def leakage_db(tmp_path: Path) -> Iterator[duckdb.DuckDBPyConnection]:
     """A DB with a realistic baseline: past matches (history floor crossed),
@@ -209,6 +248,15 @@ def leakage_db(tmp_path: Path) -> Iterator[duckdb.DuckDBPyConnection]:
     _counter["n"] = 0
     conn = duckdb.connect(str(tmp_path / "leakage.duckdb"))
     schema.create_all_tables(conn)
+
+    # --- Player metadata (static — JOINed for hand/age/height features) -------
+    # P1 right-handed with full DOB + height; P2 left-handed, no height; P3 no
+    # DOB; P4 no metadata except handedness. This mix exercises every
+    # nullability branch in compute_age / compute_age_vs_peak / height_diff.
+    _insert_player(conn, P1, hand="R", dob=date(1995, 6, 15), height=188)
+    _insert_player(conn, P2, hand="L", dob=date(1992, 3, 22), height=None)
+    _insert_player(conn, P3, hand="R", dob=None, height=183)
+    _insert_player(conn, P4, hand="U", dob=None, height=None)
 
     # --- Past history (well below TARGET_DATE) --------------------------------
     # Each of p1, p2 gets 8 warm-up matches across both surfaces.
@@ -310,6 +358,22 @@ def test_baseline_has_nontrivial_values(leakage_db: duckdb.DuckDBPyConnection) -
     # Rankings loaded.
     assert fv.rank_p1 == 25
     assert fv.rank_p2 == 40
+
+    # --- Phase 4.1 metadata + recovery features -------------------------------
+    # P1 = right-handed, P2 = left-handed.
+    assert fv.hand_p1 == "R"
+    assert fv.hand_p2 == "L"
+    # Ages computed from inserted DOBs.
+    assert fv.age_p1 is not None and 24.5 < fv.age_p1 < 25.5
+    assert fv.age_p2 is not None and 27.5 < fv.age_p2 < 28.5
+    # Heights: P1 has 188cm; P2 has none → diff is None.
+    assert fv.height_p1 == 188
+    assert fv.height_p2 is None
+    assert fv.height_diff_cm is None
+    # Recovery: P1's last completed match before TARGET_DATE was 2020-04-25
+    # (matches insertion order); P2's was 2020-04-23.
+    assert fv.days_since_last_match_p1 == (TARGET_DATE - date(2020, 4, 25)).days
+    assert fv.days_since_last_match_p2 == (TARGET_DATE - date(2020, 4, 23)).days
 
 
 @pytest.mark.leakage
@@ -458,3 +522,98 @@ def test_changing_future_tourney_name_to_indoor_does_not_change_fv(
     )
     after = _baseline_fv(leakage_db)
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1 — LastMatchState leakage tests
+# ---------------------------------------------------------------------------
+#
+# Note: `tourney_date` is the field that classifies a row as past or
+# future. Mutating it is not a leakage scenario — the system trusts the
+# stored date and will treat a moved-backward row as a legitimate past
+# observation. The realistic attack vectors are mutating winner/loser,
+# inserting brand-new future rows, and deleting future rows. Each is
+# covered below or by the structural tests further up the file.
+
+
+@pytest.mark.leakage
+def test_changing_future_winner_does_not_change_days_since(
+    leakage_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """A future P3-over-P1 result (2020-06-01) — if days_since_last_match
+    leaked through it, the recovery snapshot would shorten for P1. Must
+    stay nailed to the most recent PAST match."""
+    before = _baseline_fv(leakage_db)
+    leakage_db.execute(
+        "UPDATE matches SET winner_player_id = ?, loser_player_id = ? WHERE match_num = ?",
+        [P1, P3, 530],
+    )
+    after = _baseline_fv(leakage_db)
+    assert before.days_since_last_match_p1 == after.days_since_last_match_p1
+    assert before.days_since_last_match_p2 == after.days_since_last_match_p2
+
+
+@pytest.mark.leakage
+def test_inserting_future_player_match_does_not_shrink_days_since(
+    leakage_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Inserting a brand-new future match for P1 must NOT make
+    days_since_last_match_p1 smaller — the recovery feature is locked to
+    the most recent PAST match (2020-04-25), regardless of what happens
+    after TARGET_DATE."""
+    before = _baseline_fv(leakage_db)
+    _insert_match(
+        leakage_db,
+        winner=P1,
+        loser=P3,
+        match_date=date(2020, 5, 8),  # would be 7 days before TARGET if it leaked
+        match_num=999,
+    )
+    after = _baseline_fv(leakage_db)
+    assert before.days_since_last_match_p1 == after.days_since_last_match_p1
+    assert before.days_since_last_match_p2 == after.days_since_last_match_p2
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.1 — player-metadata fields are static (sanity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.leakage
+def test_static_metadata_fields_pinned_to_players_row(
+    leakage_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """`hand_*`, `age_*`, `height_*` come from a `players` JOIN. They are
+    static per (player, as_of_date) and don't read from `matches`. This
+    test pins the contract: mutating any future MATCH row leaves them
+    bit-identical. (Mutating the `players` row WOULD change them — that's
+    intended; `players` is a Phase 1 cold-data table and stale entries
+    are surfaced via the reconciliation pipeline, not the leakage layer.)
+    """
+    before = _baseline_fv(leakage_db)
+    # Tamper several future rows in different ways.
+    leakage_db.execute(
+        "UPDATE matches SET winner_player_id = ?, loser_player_id = ? WHERE match_num = ?",
+        [P3, P1, 530],
+    )
+    leakage_db.execute(
+        "UPDATE matches SET score = ?, surface = ? WHERE match_num = ?",
+        ["6-4 4-6 7-6(5) 4-6 6-4", "Clay", 500],
+    )
+    _insert_match(
+        leakage_db,
+        winner=P1,
+        loser=P3,
+        match_date=date(2020, 7, 1),
+        match_num=901,
+    )
+    after = _baseline_fv(leakage_db)
+    assert before.hand_p1 == after.hand_p1
+    assert before.hand_p2 == after.hand_p2
+    assert before.age_p1 == after.age_p1
+    assert before.age_p2 == after.age_p2
+    assert before.age_vs_peak_p1 == after.age_vs_peak_p1
+    assert before.age_vs_peak_p2 == after.age_vs_peak_p2
+    assert before.height_p1 == after.height_p1
+    assert before.height_p2 == after.height_p2
+    assert before.height_diff_cm == after.height_diff_cm

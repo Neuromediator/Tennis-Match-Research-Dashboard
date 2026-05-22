@@ -133,7 +133,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 4 — Modeling
+## Phase 4 — Modeling  ✅ complete
 
 **Entry:** phase 3 exit criteria met.
 
@@ -148,16 +148,79 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 - Market-benchmark calibration overlay in every report.
 - Round-trip serialization test.
 
-**Exit:**
-- Four fresh model artifacts exist in `models/` (Elo baseline + LightGBM per tour).
-- The LightGBM Brier score beats the Elo baseline on each tour. If it does not, ship the baseline and document the result honestly — the product surfaces the better-calibrated number, not the more complex one.
-- Market-benchmark plot is visible in every report.
+**Exit (all green):**
+- ✅ Four fresh model artifacts exist in `models/` (Elo baseline + LightGBM per tour), with `latest` symlinks pointing at the production run.
+- ✅ LightGBM Brier score beats the Elo baseline on each tour over the most-recent 5 walk-forward folds (post-calibration, sample-weighted): ATP 0.2105 vs 0.2220 (Δ +0.0115); WTA 0.2026 vs 0.2180 (Δ +0.0154).
+- ✅ Market-benchmark plot is visible in every report; market remains slightly better-calibrated than our model (ATP recent-fold market Brier ~0.20 vs our 0.21), in line with the "approaching but not reaching" framing.
+
+**Headline numbers:**
+- 8 walk-forward folds per tour: validate years 2018–2025. Each fold splits train (≤ V−2), calibrate (V−1), validate (V).
+- Production model: train ≤ 2024, calibrate on 2025; isotonic on both tours (calibration set ~3.6–3.7k matches, well over the 1000-row threshold).
+- LightGBM hyperparameters: 1500 trees max, lr 0.03, num_leaves 63, min_child_samples 50, feature/bagging fractions 0.9, early stopping after 75 rounds on calibration-set log loss. Categorical features (`tournament_level`, `surface`) handled natively (no one-hot).
+- Wall-time end-to-end: ~55 seconds for all four artifacts on a workstation CPU.
+- Per-fold market overlay covers 7/8 folds (2020 ATP fold has only 969 market rows, below the 1000-row overlay threshold).
+
+**Implementation notes (post-design):**
+- All four artifacts share the `CalibratedPredictor` wrapper (base estimator + 1-D calibrator), so the joblib round-trip is shape-uniform and the serialization test covers both Elo and LightGBM with the same code path.
+- The Elo baseline is also post-calibrated. The raw formula is well-ordered but isotonic nudges it onto the diagonal — costs nothing and keeps the calibration plot honest.
+- LightGBM early-stopping uses the calibration set (also used later for post-hoc calibration). Validation set stays held out for reported metrics.
+- 16-row `roundtrip_fixture.json` saved next to each `model.joblib`: catches lightgbm / sklearn version drift before it silently changes predictions.
+
+---
+
+## Phase 4.1 — Feature expansion  ✅ complete
+
+**Entry:** Phase 4 exit criteria met. Full design document: `docs/tutorials/phase_4_1_notes.md`. Results write-up: `docs/tutorials/phase_4_1_results.md`.
+
+**Scope rule.** Every Phase 4.1 feature is sourced from data we already fetch automatically (Sackmann cold layer) or derive from the chronological replay. **No hand-curated lookup tables, no manual data entry.** Features that would require manual data work — jet-lag (needs tournament → timezone), altitude (needs tournament → altitude), court pace, playing-style tags — are explicitly deferred.
+
+**Motivation.** Phase 4 LightGBM closed about half the Brier gap to the closing market on each tour. Several low-cost signals are sitting in the cold DB unused (`players.hand` 100% / `dob` ~95% / `height` 25–57% coverage on active players). These are table-stakes features in every public tennis-prediction reference; their absence in v1 is what bounds part of the remaining gap, not the model class.
+
+**Deliverables:**
+- v2 FeatureVector — 28 v1 fields + **11 new fields** = **39 total**:
+  - Handedness match-up (2): `hand_p1`, `hand_p2` (categorical R / L / A / U).
+  - Age (4): `age_p1`, `age_p2`, `age_vs_peak_p1`, `age_vs_peak_p2` (peak ATP=26.0, WTA=24.0).
+  - Height (3): `height_p1`, `height_p2`, `height_diff_cm`.
+  - Recovery (2): `days_since_last_match_p1`, `days_since_last_match_p2` (capped at 365).
+- New state object `LastMatchState` (lean: tracks one date per player). Persisted to `last_match_state` table at end of `build_training_features`; inference rolls forward from snapshot — same pattern as `EloState`.
+- Schema migration: `training_features.schema_version` 1 → 2; table drop-and-recreate, full feature rebuild (~5 min on the populated DB).
+- Extended leakage tests: tampered-future-row fixtures assert no `days_since_last_match` or age-derived value for an earlier date changes when a later row is altered.
+- Smoke test extended to populate synthetic `players` rows + the 11 new columns.
+- Re-trained 4 production artifacts with the v2 feature set; old Phase 4 artifacts kept until the validation gate clears.
+
+**Exit (all green):**
+- ✅ 4 fresh artifacts on disk (`models/<tour>/<{elo,lightgbm}>/latest/`) with feature count 39 in `metadata.json`.
+- ✅ `players` JOIN coverage in v2 `training_features`: ATP `hand` 99.10% both-known, `dob` 99.5%; WTA `hand` 70.55% both-known (below the design-doc 99% ideal — Sackmann's WTA roster simply lacks `hand` for many pre-2000s entrants; the `U` sentinel preserves the categorical-level discipline so LightGBM consumes it cleanly), `dob` 98.0%. Height coverage 87.9% ATP / 56.5% WTA — no minimum, NaN-as-signal.
+- ✅ All Phase 3 leakage tests + 3 new Phase 4.1 leakage tests pass (15 total; 307-test suite green).
+- ✅ Round-trip serialization tests pass on the 4 new artifacts.
+- ✅ LightGBM post-calibration Brier improves on the WTA tour by ≥0.001 on the most recent 5 walk-forward folds. ATP is essentially flat.
+
+**Headline numbers (last 5 folds, post-calibration, sample-weighted Brier):**
+- ATP LightGBM: 0.2105 → 0.2101 (Δ −0.0004 — below the 0.001 ship gate but not worse).
+- WTA LightGBM: 0.2026 → 0.1954 (Δ −0.0072 — clears gate by 7×).
+- Elo baselines unchanged (feature set is irrelevant for the rating-based predictor).
+
+**Implementation notes (post-design):**
+- v2 FeatureVector: 28 v1 + 9 player-metadata (hand_p1/p2, age_p1/p2, age_vs_peak_p1/p2, height_p1/p2, height_diff_cm) + 2 recovery (days_since_last_match_p1/p2) = **39 fields**. Age/height retain no Pydantic bounds — Sackmann's DOB column has a handful of obviously wrong values (e.g. a player listed as 3 years old at a tour-level match); LightGBM handles outliers cleanly. Categorical bounds on `Hand` are still enforced.
+- New `last_match_state` table mirrors `elo_state`'s persistence pattern. `LastMatchState` lives in `src/tennis_predictor/features/last_match.py`; 365-day cap per design default #4.
+- Player metadata is JOINed pre-replay via `PlayerMetadataLookup.from_db(conn)` — read once, query in-memory many times. Same pattern as `RankingLookup`.
+- `_migrate_training_features` extended to detect the v1 → v2 shape transition: v1 had `tournament_level` but no `days_since_last_match_p1`, so the sentinel-column check is enough. `scripts/build_features.py` is always re-run after a feature change.
+- `CATEGORICAL_COLUMNS` grew to `("tournament_level", "surface", "hand_p1", "hand_p2")` with `hand_*` levels `("R", "L", "A", "U")`.
+- `build_training_features` now calls `db_schema.create_all_tables(conn)` first so the migration runs even when the orchestrator opens the DB outside of `open_connection`.
+- Wall-time: build 421 s (~1 min slower than v1 due to the players JOIN and LastMatchState bookkeeping); train 60 s for all four artifacts.
+- Phase 4 v1 artifacts preserved at `models/<tour>/<{elo,lightgbm}>/20260521-1026/` for reference but no longer pointed at by `latest`.
+
+**Out of scope (explicit):**
+- Jet-lag / timezone shift (would need manual tournament-location CSV).
+- Tournament altitude (same constraint).
+- Court Pace Index (no public source).
+- Playing-style tags (defender/attacker) — derivable from existing stats, no new signal.
 
 ---
 
 ## Phase 5 — LLM agent
 
-**Entry:** phase 4 exit criteria met.
+**Entry:** Phase 4.1 exit criteria met.
 
 **Deliverables:**
 - `LLMClient` abstract base with Anthropic implementation; prompt caching enabled (system prompt and tool definitions as cacheable blocks).

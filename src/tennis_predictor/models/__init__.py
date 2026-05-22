@@ -1,1 +1,4 @@
-"""Modeling: training, walk-forward validation, calibration, persistence. Phase 4."""
+"""Modeling layer: walk-forward training, calibration, artifact persistence.
+
+See `.claude/skills/model-training/SKILL.md` for the discipline this layer enforces.
+"""

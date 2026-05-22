@@ -4,7 +4,9 @@ A working tool that gives calibrated win probabilities for upcoming ATP and WTA 
 
 **Not a betting tool — we do not claim to beat the market.**
 
-**Status:** Phases 1 (cold data), 2 (hot data), and 3 (feature engineering) complete — see [docs/phases.md](docs/phases.md). Phase 4 (modeling: walk-forward validation, LightGBM + Elo baseline, calibration) is next.
+**Status:** Phases 1 (cold data), 2 (hot data), 3 (feature engineering), 4 (modeling: walk-forward + isotonic calibration + market benchmark), and 4.1 (player-metadata + recovery feature expansion to v2 FeatureVector, 39 fields) complete — see [docs/phases.md](docs/phases.md). Phase 5 (LLM agent) is next.
+
+**Current production headline numbers** (last-5-fold sample-weighted Brier, post-calibration): ATP LightGBM **0.2101**, WTA LightGBM **0.1954**, both ahead of the Surface-Elo baseline (ATP 0.2220, WTA 0.2180).
 
 See [docs/architecture.md](docs/architecture.md), [docs/methodology.md](docs/methodology.md), and [docs/phases.md](docs/phases.md) for details.
 
@@ -27,11 +29,13 @@ uv run python scripts/refresh_hot.py
 # Promote reviewed aliases (after editing data/processed/aliases_review*.csv)
 uv run python scripts/apply_aliases_review.py
 
-# Build the training_features table + persist elo_state (phase 3)
+# Build the training_features table + persist elo_state + last_match_state (phases 3 / 4.1)
 uv run python scripts/build_features.py
 
+# Train the four production models (Elo + LightGBM per tour) — phases 4 / 4.1
+uv run python scripts/train_models.py
+
 # (later phases)
-uv run python scripts/train_models.py            # phase 4
 uv run streamlit run src/tennis_predictor/app/main.py  # phase 6+
 ```
 

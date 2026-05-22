@@ -61,6 +61,13 @@ import duckdb
 from tennis_predictor.features.elo import EloState
 from tennis_predictor.features.fatigue import FatigueState, count_sets
 from tennis_predictor.features.h2h import H2HState
+from tennis_predictor.features.last_match import LastMatchState
+from tennis_predictor.features.player_metadata import (
+    PlayerMetadataLookup,
+    compute_age,
+    compute_age_vs_peak,
+    compute_height_diff,
+)
 from tennis_predictor.features.ranking import RankingLookup
 from tennis_predictor.features.rolling_form import RollingFormState
 from tennis_predictor.features.schema import FeatureVector, Surface, TournamentLevel
@@ -107,12 +114,13 @@ def compute_features(
     *,
     elo: EloState | None = None,
     ranking_lookup: RankingLookup | None = None,
+    player_metadata: PlayerMetadataLookup | None = None,
 ) -> FeatureVector:
     """Return the FeatureVector for `(player_id, opponent_id)` as of
     `as_of_date`.
 
-    `elo` and `ranking_lookup` may be passed pre-loaded (Phase 6 cache);
-    omitting them triggers a fresh load from `elo_state` / `rankings`.
+    `elo`, `ranking_lookup`, and `player_metadata` may be passed pre-loaded
+    (Phase 6 cache); omitting them triggers a fresh load from DB.
     """
     if player_id == opponent_id:
         raise ValueError("player_id and opponent_id must differ")
@@ -126,13 +134,15 @@ def compute_features(
 
     if ranking_lookup is None:
         ranking_lookup = RankingLookup.from_db(conn)
+    if player_metadata is None:
+        player_metadata = PlayerMetadataLookup.from_db(conn)
 
-    # Elo: load the persisted snapshot when safe; otherwise rebuild from
-    # scratch by replaying every relevant match in the history loop below.
-    # The persisted elo_state reflects state AFTER every match in the DB,
-    # so it leaks information when `as_of_date <= snapshot_date` — for that
-    # case (e.g. the training-vs-inference equivalence test, or any
-    # historical inference) we deliberately discard the snapshot.
+    # Elo + LastMatch: load the persisted snapshot when safe; otherwise
+    # rebuild from scratch by replaying every relevant match in the history
+    # loop below. The persisted snapshots reflect state AFTER every match
+    # in the DB, so they leak information when `as_of_date <= snapshot_date`
+    # — for that case (e.g. the training-vs-inference equivalence test, or
+    # any historical inference) we deliberately discard the snapshot.
     persisted_snapshot_date = _elo_snapshot_date(conn)
     if elo is None:
         if persisted_snapshot_date is not None and persisted_snapshot_date < as_of_date:
@@ -146,6 +156,16 @@ def compute_features(
         # with the persisted date (they presumably loaded it from the same DB).
         elo_baseline_date = persisted_snapshot_date
 
+    # LastMatchState uses the same baseline-date discipline as Elo: the
+    # persisted snapshot is post-every-match, so it's only safe to seed
+    # from when `as_of_date` is strictly later than the snapshot.
+    if elo_baseline_date is not None:
+        last_match = LastMatchState.from_db(conn)
+        last_match_baseline_date: date | None = elo_baseline_date
+    else:
+        last_match = LastMatchState()
+        last_match_baseline_date = None
+
     # Build the rest of the states fresh by replaying every completed
     # match either player has played before `as_of_date`.
     form = RollingFormState()
@@ -158,9 +178,12 @@ def compute_features(
         h2h.update(h.winner_id, h.loser_id, h.match_date)
         fatigue.update(h.winner_id, h.loser_id, count_sets(h.score), h.match_date)
         serve_return.update(h.winner_id, h.loser_id, h.surface, h.match_date, h.stats)
-        # Elo: skip matches already incorporated into the persisted snapshot.
+        # Elo + LastMatch: skip matches already in the persisted snapshot.
         if elo_baseline_date is None or h.match_date > elo_baseline_date:
             elo.update(h.winner_id, h.loser_id, h.surface, h.match_date)
+        if last_match_baseline_date is None or h.match_date > last_match_baseline_date:
+            last_match.update(h.winner_id, h.match_date)
+            last_match.update(h.loser_id, h.match_date)
 
     # Snapshots.
     elo_p1 = elo.get(p1, surface)
@@ -174,6 +197,13 @@ def compute_features(
     rank_p2 = ranking_lookup.get(p2, as_of_date)
     sr1 = serve_return.snapshot(p1, surface)
     sr2 = serve_return.snapshot(p2, surface)
+
+    meta_p1 = player_metadata.get(p1)
+    meta_p2 = player_metadata.get(p2)
+    age_p1 = compute_age(meta_p1.dob, as_of_date)
+    age_p2 = compute_age(meta_p2.dob, as_of_date)
+    days_since_p1 = last_match.days_since(p1, as_of_date)
+    days_since_p2 = last_match.days_since(p2, as_of_date)
 
     return FeatureVector.model_validate(
         {
@@ -205,6 +235,17 @@ def compute_features(
             "tournament_level": tournament_level,
             "best_of": best_of,
             "surface": surface,
+            "hand_p1": meta_p1.hand,
+            "hand_p2": meta_p2.hand,
+            "age_p1": age_p1,
+            "age_p2": age_p2,
+            "age_vs_peak_p1": compute_age_vs_peak(age_p1, tour),
+            "age_vs_peak_p2": compute_age_vs_peak(age_p2, tour),
+            "height_p1": meta_p1.height,
+            "height_p2": meta_p2.height,
+            "height_diff_cm": compute_height_diff(meta_p1.height, meta_p2.height),
+            "days_since_last_match_p1": days_since_p1,
+            "days_since_last_match_p2": days_since_p2,
         }
     )
 
