@@ -54,7 +54,7 @@ A single-process Python application with five logical layers. No microservices. 
 
 - Local dev: `uv run streamlit run ...`. DuckDB file at `data/processed/tennis.duckdb`.
 - Containerized (phase 7): single Dockerfile. DuckDB file mounted from a volume. The container is stateless except for that volume.
-- Target: Fly.io or Railway (final choice in phase 7).
+- Target: Fly.io (locked in Phase 7 design — see `docs/phases.md`). Public URL, no auth gate; budget protection via per-IP rate limit + hard daily $ cap.
 
 ## What is intentionally absent
 

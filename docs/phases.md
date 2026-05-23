@@ -280,34 +280,71 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ## Phase 6 — Streamlit app
 
-**Entry:** phase 5 exit criteria met.
+**Entry:** phase 5.1 exit criteria met.
 
 **Deliverables:**
 - **Home page — upcoming matches.** Sourced from `scheduled_matches`. Grouped by tournament, sorted by scheduled start. Each row links to its prediction page. This is the primary entry point — most users arrive wanting "predict tonight's matches", not "type in two player names."
-- **Prediction page.** Shows: model probability (with the LLM's `confidence_band` as a qualitative tag), `key_factors` and `narrative`, `caveats`, news links surfaced by `search_tennis_news`, and a freshness indicator from `ingestion_runs`.
+- **Prediction page.** Shows: model probability (with the LLM's `confidence_band` as a qualitative tag), `key_factors` and `narrative`, `caveats`, news links surfaced by Tavily `web_search` (and optionally `fetch_url` content for the ~5% deep-dive cases), and a freshness indicator from `ingestion_runs`.
 - **Custom prediction page (secondary).** Manual player + tournament + surface + date entry, for matches not in `scheduled_matches` or for "what-if" questions.
-- **Dashboard page.** Per-model calibration plots (model vs market overlay), headline metrics over walk-forward folds, recent `llm_traces` browser. This is the "trust" tab — a curious user opens it to see why they should trust the number on the prediction page.
+- **Dashboard page.** Per-model calibration plots (model vs market overlay), headline metrics over walk-forward folds, recent `llm_traces` browser, and a **cost monitor** (today's $ spend / month-to-date / cache hit rate / breakdown of `web_search_count` vs `fetch_url_count`) sourced from `llm_traces`. This is the "trust" tab — a curious user opens it to see why they should trust the number on the prediction page AND that we aren't accidentally burning budget.
 - Sensible empty / error states. Stale-data warning shown when `ingestion_runs` reports the last successful hot refresh is over 24h old.
+
+**Implementation notes:**
+- `TennisAgent.predict()` is async; Streamlit pages call it via `asyncio.run(...)` (or `nest_asyncio.apply()` if needed). The DuckDB connection is held in `st.session_state` so it survives Streamlit's per-interaction re-runs without repeatedly opening / closing the file.
+- All four pages read from the same DuckDB file (Phase 1 cold + Phase 2 hot + Phase 5 `llm_traces`). No new tables.
 
 **Exit:**
 - `uv run streamlit run src/tennis_predictor/app/main.py` works end to end.
 - Manual smoke test of the golden path (open home → pick a fixture → see prediction + news) and at least two edge cases: a player with no recent matches; hot API marked stale.
+- Cost monitor on the Dashboard page reads non-zero data from `llm_traces` for the smoke-test predictions.
 
 ---
 
-## Phase 7 — Deployment
+## Phase 7 — Deployment (Fly.io, fully public)
 
-**Entry:** phase 6 exit criteria met.
+**Entry:** Phase 6 exit criteria met.
+
+**Provider locked:** Fly.io. Reasoning: first-class persistent volumes (DuckDB needs one — Railway / Streamlit Cloud don't offer this cleanly), scheduled-machines for the daily hot refresh, generous free tier that covers our load, single-region deployment is fine for a personal project.
+
+**Auth strategy:** **none — fully public URL.** Implications:
+
+- Anyone who finds the URL can spend our Anthropic budget.
+- Rate limiting + hard daily cost cap is the ONLY abuse protection. Get this right.
+- We accept the risk in exchange for shareable-link convenience. The Anthropic-console $20/month hard cap (Phase 5 deliverable) is the ultimate wall — no software bug can spend past it.
 
 **Deliverables:**
-- Dockerfile producing an image that runs the Streamlit app, with the DuckDB file mounted from a volume.
-- Fly.io or Railway deployment configuration committed (provider chosen by start of this phase).
-- Daily hot refresh runs on a scheduler (Fly cron / Railway cron / GitHub Actions) — not manually.
-- **Cost discipline.** Anthropic API calls are rate-limited per session (or per IP if anonymous). Daily Anthropic-spend cap configured; on overrun the app shows a clean "service unavailable, daily limit reached" state instead of failing requests one by one. The cap is documented in README.
-- README polished: setup, run, deploy, public URL, links to docs.
-- `.env.example` exhaustively updated.
+
+1. **Dockerfile** — `python:3.12-slim` base, `uv` for dependency install, multi-stage so the runtime image excludes dev deps and source tarballs. Final image ~300-400 MB. Streamlit listens on `$PORT` (Fly.io convention).
+
+2. **`fly.toml`** — single app, 1 small machine + auto-stop after idle (free-tier-friendly), mounted volume at `/data` for `tennis.duckdb` (3 GB), HTTP health check on `/_stcore/health` (Streamlit's built-in), auto-scaling `0 → 1` machine when traffic arrives.
+
+3. **Secrets via `fly secrets set`** — `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`. Never committed.
+
+4. **Daily hot refresh — separate Fly.io scheduled machine** running `uv run python scripts/refresh_hot.py` once per day (~03:00 UTC, off-peak). Mounts the same `/data` volume as the app. Writes to `ingestion_runs`; the app reads freshness from there. Why scheduled-machine over GitHub Actions: tight coupling to the same volume, no need to set up SSH / a refresh-trigger HTTP endpoint in the app, ~$0.50/month extra at most.
+
+5. **Rate limiting + hard cap** (the only abuse protection, see "Auth strategy" above):
+   - **Per-IP:** 5 predictions / IP / 24h, stored in a small JSON file on the volume. Sufficient to block single-IP scrapers while letting your own daily use through.
+   - **Hard daily $ cap:** before invoking `TennisAgent.predict()`, query `SUM(estimated_cost_usd) WHERE ts >= today UTC` from `llm_traces`. If >= `DAILY_LLM_USD_CAP` (default $2.00, configurable), return a clean "service has hit its daily limit, please come back tomorrow" page instead of letting the prediction proceed.
+   - **Footer indicator** showing today's $ spend / monthly $ spend on every page (sourced from `llm_traces.estimated_cost_usd`).
+
+6. **README polish** — setup (local), deploy (`fly launch` walkthrough), public URL, monthly cost breakdown, how to rotate keys, how to bump the daily cap.
+
+7. **`.env.example` exhaustively updated** — every env var the app reads, with a short description and where to get the key.
+
+8. **Teardown procedure documented** — one paragraph: `fly apps destroy tennis-predictor` + `fly volumes destroy <vol-id>` + revoke Anthropic workspace + revoke Tavily key. Important so the project doesn't quietly burn budget after attention shifts.
 
 **Exit:**
-- App is reachable at a public URL.
-- A teardown procedure is documented (so the project doesn't quietly burn budget after attention shifts).
-- First-load latency on a cold container: a real prediction for an upcoming match renders within a few seconds.
+
+- App reachable at a public URL (e.g. `tennis-predictor.fly.dev`).
+- Daily refresh ran 3+ consecutive days without manual touch — confirmed via `SELECT * FROM ingestion_runs WHERE source='matchstat' ORDER BY started_at DESC LIMIT 3`.
+- Rate-limit verified: a single IP hitting prediction #6 on the same day gets the rate-limit page; first 100 unique IPs are served normally.
+- Hard cap verified: simulating $2+ spend in a dev run triggers the limit-reached page; recovery the next UTC day works.
+- First-load latency on a cold container: <8s for the home page, <15s for a real prediction (Tavily + Anthropic roundtrips dominate).
+- Monthly cost observation documented in README across the first 30 days post-launch.
+
+**Cost expectation (monthly):**
+
+- Fly.io app machine + worker machine + 3 GB volume: ~$0-3 (free tier covers most of it; volume is $0.15/GB/mo = $0.45).
+- Anthropic at typical load (5-10 predicts/day × $0.10): $5-10. Hard daily cap blocks runaway scenarios.
+- Tavily: $0 (free tier covers ~300 searches/month vs our typical ~150).
+- **Total expected: ~$5-10/month.** Worst case if URL gets shared widely and hard caps hold: ~$30 (Anthropic dominates, capped by org wall at $20).
