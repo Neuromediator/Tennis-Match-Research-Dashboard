@@ -55,7 +55,8 @@ Active model symlinked at `models/<tour>/<model_type>/latest`.
 ## Anthropic SDK
 
 - **Default model:** `claude-sonnet-4-6`. Picked over Opus 4.7 (~5× cost, marginal quality gain on our synthesis task) and Haiku 4.5 (noticeably weaker on multi-source reconciliation in `narrative` / `caveats`). Configurable via `ANTHROPIC_MODEL`.
-- **Provider stack:** Direct `anthropic` SDK only. No abstraction-layer wrappers (LangChain, LiteLLM, OpenRouter, Anthropic Managed Agents). Vendor flexibility comes from our own `LLMClient` ABC, not from third-party multi-provider layers. Reasoning: native `web_search`, explicit `cache_control` markers, and best-in-class tool-use reliability are all features abstraction layers either lose entirely or surface poorly. If a future provider beats Anthropic on this combo, swap is a new `LLMClient` implementation (~100 lines), not a framework migration.
+- **Provider stack:** Direct `anthropic` SDK only. No abstraction-layer wrappers (LangChain, LiteLLM, OpenRouter, Anthropic Managed Agents). Vendor flexibility comes from our own `LLMClient` ABC, not from third-party multi-provider layers. Reasoning: explicit `cache_control` markers and best-in-class tool-use reliability are features abstraction layers either lose entirely or surface poorly. If a future provider beats Anthropic on this combo, swap is a new `LLMClient` implementation (~100 lines), not a framework migration.
+- **`web_search` is NOT an Anthropic native server tool** (Phase 5.1 swap). It's our client-side tool against Tavily — see the "Web search" section below. The `LLMClient` doesn't know about search providers; the agent loop dispatches `web_search` / `fetch_url` like any other client tool.
 - The `LLMClient` abstract base lives in `src/tennis_predictor/llm/client.py`. Use it; do not call `anthropic.Anthropic()` directly outside that module.
 - **Prompt caching is on by default.** System prompt + tool definitions are sent with `cache_control` markers. Our typical agent call has ~2000 stable input tokens that cache → ~70% input-cost reduction on the second-and-later call within the 5-minute TTL window. One marker, on the last tool definition (caches everything prefix to it).
 - **Cache hit hygiene.** The cacheable prefix (system prompt + tool definitions) must be byte-stable across calls. Never inject timestamps, random IDs, or session-specific data into the system prompt — current date and match context belong in the user message. A unit test on `LLMClient._build_cacheable_blocks()` enforces byte-equality between two consecutive calls; if it fails, the cache-hit rate just dropped to ~0%.
@@ -63,12 +64,17 @@ Active model symlinked at `models/<tour>/<model_type>/latest`.
 
 ## Web search
 
-- **Tool:** Anthropic native `web_search`, configured with a small `blocked_domains` list (betting / pick-of-the-day clickbait) and **no** `allowed_domains` — we want maximum recall on legitimate news (local press, journalist tweets, dedicated tennis outlets) and rely on Anthropic's own ranking to filter out the worst.
-- **Preferred sources** (mentioned in system prompt, not whitelist-enforced — Anthropic API has no `preferred_domains` parameter): **ESPN, BBC, tennis.com, tennis365.com**, X/Twitter when accessible. The two tour-official sites (`atptour.com`, `wtatennis.com`) are intentionally **not** highlighted — they surface only the news everyone already knows, almost always about top-10 players, and don't add value over the journalist sources above.
-- **Budget per agent call:** `max_uses = 3` (typically one query per player, optionally one tournament query).
-- **Recency window:** the last ~14 days, enforced via system-prompt instruction (Anthropic does not expose a time-range parameter).
-- **Anti-fabrication clause** in the system prompt: when search returns nothing material, the agent MUST explicitly note "no recent news surfaced" in `caveats`. It MUST NOT fabricate plausible-sounding news to fill the slot.
-- **Cost:** ~$10 per 1000 searches × ~2 searches per prediction ≈ $0.02 per prediction.
+- **Tool (Phase 5.1):** **Tavily Search API** (`basic` depth), wrapped by our own client-side `web_search` tool in `src/tennis_predictor/llm/tools/web_search.py`. Replaced Anthropic native `web_search_20250305` after the Phase 5 A/B (`scripts/compare_search_providers.py`) showed Tavily is 9.5x cheaper per search, 3.5x faster, and matches Anthropic on niche discovery while delivering more diverse sources (Yahoo / BBC / Reddit / local press rather than Anthropic's tour-official bias).
+- **Companion tool (Phase 5.1):** **`fetch_url`** backed by Tavily Extract. For the ~5% case where a snippet truncates a needed detail (e.g. Kasatkina-style interview), the LLM may follow up on one specific URL. `AgentBudget.max_fetch_urls = 2` per agent call.
+- **`exclude_domains`:** small blocklist of betting / pick-of-the-day clickbait: `draftkings.com, fanduel.com, betmgm.com, pickwise.com, actionnetwork.com`. Same list Phase 5 used.
+- **No `include_domains`** — we want maximum recall on legitimate news. Tavily ranking is good enough that whitelisting would hurt more than help.
+- **Preferred sources** (mentioned in system prompt, not whitelist-enforced): **ESPN, BBC, tennis.com, tennis365.com**, X/Twitter when surfaced. Tour-official `atptour.com` / `wtatennis.com` are intentionally not highlighted — they surface only news everyone already has.
+- **Budget per agent call:** `max_web_searches = 3` + `max_fetch_urls = 2`. Atomic reservation via `BudgetTracker.reserve_web_search / reserve_fetch_url` prevents parallel tool_uses in a single turn from overshooting the cap.
+- **Recency window:** the last ~14 days, enforced via system-prompt instruction (Tavily basic does not expose a time-range parameter; `search_depth: "advanced"` does but costs 5x — defer).
+- **Anti-fabrication clause** in the system prompt: when search returns nothing material, the agent MUST explicitly note "no recent news surfaced" in `caveats`. It MUST NOT fabricate plausible-sounding news.
+- **Cost:** Tavily basic free tier covers 1000 searches/month (~300/month at 5-10 predicts/day). Paid plan: $0.005 per search + $0.005 per fetch. Total search-line cost per prediction: ~$0.01-0.02.
+- **HTTP transport:** `httpx.AsyncClient` with `retries=2` (built-in transport-level retry). Tavily 5xx / 4xx / timeout → typed `TavilyError`, caught by agent loop and surfaced as `tool_result(is_error=True)` (CLAUDE.md failure-mode #1).
+- **`fetch_url` failures** (paywall, JS-only page, Tavily can't extract): NOT raised — returned as `FetchUrlOutput(extraction_success=False)`, agent mentions "could not retrieve full article" in `caveats` (failure-mode #7).
 
 ## LLM agent failure modes
 

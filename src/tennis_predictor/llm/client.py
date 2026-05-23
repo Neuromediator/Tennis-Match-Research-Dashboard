@@ -55,17 +55,9 @@ from tennis_predictor.llm.prompts import SYSTEM_PROMPT, system_prompt_hash
 
 logger = logging.getLogger(__name__)
 
-# Web-search blocklist — the small set of betting / pick-of-the-day domains
-# from CLAUDE.md "Web search". Kept centralised so swapping vendor is a
-# one-place change.
-WEB_SEARCH_BLOCKED_DOMAINS: tuple[str, ...] = (
-    "draftkings.com",
-    "fanduel.com",
-    "betmgm.com",
-    "pickwise.com",
-    "actionnetwork.com",
-)
-WEB_SEARCH_MAX_USES: int = 3
+# Phase 5.1: web_search is no longer Anthropic native — it's our client-side
+# Tavily wrapper. Per-vendor constants (BLOCKED_DOMAINS, MAX_USES) live in
+# `tools/web_search.py` now. This module knows nothing about search providers.
 
 
 class LLMCallFailure(Exception):
@@ -124,9 +116,18 @@ class LLMClient(ABC):
         tools: list[dict[str, Any]],
         tool_choice: dict[str, Any],
         max_tokens: int,
+        extra_tool_cost_usd: float = 0.0,
+        extra_web_search_count: int = 0,
+        extra_fetch_url_count: int = 0,
     ) -> LLMResponse:
         """Send one turn to the model. Implementations MUST log to
-        `llm_traces` (success or failure) before returning / raising."""
+        `llm_traces` (success or failure) before returning / raising.
+
+        Phase 5.1 added `extra_*` kwargs so the agent loop can attribute
+        tool activity that occurred between LLM calls (Tavily search /
+        fetch_url) to the next trace row, keeping `llm_traces` honest
+        about the full per-iteration cost rather than just the
+        Anthropic-side spend."""
 
 
 class AnthropicLLMClient(LLMClient):
@@ -206,7 +207,19 @@ class AnthropicLLMClient(LLMClient):
         tools: list[dict[str, Any]],
         tool_choice: dict[str, Any],
         max_tokens: int,
+        extra_tool_cost_usd: float = 0.0,
+        extra_web_search_count: int = 0,
+        extra_fetch_url_count: int = 0,
     ) -> LLMResponse:
+        """Send one turn to Anthropic.
+
+        Phase 5.1: `extra_*` kwargs let the agent loop attribute Tavily
+        costs (web_search, fetch_url) that happened BETWEEN LLM calls to
+        the next trace row, so `llm_traces.estimated_cost_usd` and the
+        tool counters reflect the full per-LLM-iteration cost rather
+        than just the Anthropic-side spend. The agent loop accumulates
+        these in `BudgetTracker` and consumes them before each call.
+        """
         system, tools_with_cache = self._build_cacheable_blocks(tools)
         request_body: dict[str, Any] = {
             "model": self._model,
@@ -230,22 +243,35 @@ class AnthropicLLMClient(LLMClient):
                 response=None,
                 error=error_text,
                 latency_ms=latency_ms,
-                cost_usd=0.0,
-                web_search_count=0,
+                cost_usd=extra_tool_cost_usd,
+                web_search_count=extra_web_search_count,
+                fetch_url_count=extra_fetch_url_count,
             )
             raise LLMCallFailure(error_text) from exc
 
         latency_ms = int((time.monotonic() - started_at) * 1000)
         parsed = _parse_response(response, latency_ms=latency_ms, model=self._model)
+        # Fold pre-call Tavily activity into the trace row. The LLMResponse
+        # itself reflects per-call Anthropic data only; the merged values
+        # below give the trace its full cost picture.
+        merged_cost = parsed.estimated_cost_usd + extra_tool_cost_usd
+        merged_web_search_count = parsed.web_search_count + extra_web_search_count
         trace_id = self._log_trace(
             messages=messages,
             response=parsed,
             error=None,
             latency_ms=latency_ms,
-            cost_usd=parsed.estimated_cost_usd,
-            web_search_count=parsed.web_search_count,
+            cost_usd=merged_cost,
+            web_search_count=merged_web_search_count,
+            fetch_url_count=extra_fetch_url_count,
         )
-        return parsed.model_copy(update={"trace_id": trace_id})
+        return parsed.model_copy(
+            update={
+                "trace_id": trace_id,
+                "estimated_cost_usd": merged_cost,
+                "web_search_count": merged_web_search_count,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Trace logging
@@ -260,10 +286,15 @@ class AnthropicLLMClient(LLMClient):
         latency_ms: int,
         cost_usd: float,
         web_search_count: int,
+        fetch_url_count: int = 0,
     ) -> int | None:
         """Insert one row into `llm_traces`. Returns the inserted trace_id,
         or None if the insert itself raises (we still propagate the
-        original API error in that case rather than masking it)."""
+        original API error in that case rather than masking it).
+
+        Phase 5.1: `fetch_url_count` column added so the dashboard can
+        distinguish search vs follow-up fetch usage.
+        """
         try:
             row = self._conn.execute(
                 """
@@ -271,9 +302,9 @@ class AnthropicLLMClient(LLMClient):
                     ts, model, system_prompt_hash, input_messages, tool_calls,
                     output, tokens_in, tokens_out, cache_read_tokens,
                     cache_creation_tokens, latency_ms, error,
-                    web_search_count, estimated_cost_usd
+                    web_search_count, estimated_cost_usd, fetch_url_count
                 ) VALUES (
-                    CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 RETURNING trace_id
                 """,
@@ -293,6 +324,7 @@ class AnthropicLLMClient(LLMClient):
                     error,
                     web_search_count,
                     cost_usd,
+                    fetch_url_count,
                 ],
             ).fetchone()
             return int(row[0]) if row is not None else None
@@ -336,9 +368,12 @@ def _parse_response(response: Any, *, latency_ms: int, model: str) -> LLMRespons
                 )
             )
         elif block_type in ("server_tool_use", "web_search_tool_result"):
+            # Phase 5.1: web_search is no longer Anthropic-server-side; if a
+            # server_tool_use block arrives here it's from some FUTURE
+            # Anthropic-native server tool. Recorded as a string but NOT
+            # counted toward web_search_count — that counter now belongs
+            # to the agent's client-side dispatch path.
             server_tool_uses.append(block_dump.get("name", block_type))
-            if block_type == "server_tool_use" and block_dump.get("name") == "web_search":
-                web_search_count += 1
 
     estimated_cost_usd = estimate_call_cost(
         model=model,
@@ -365,27 +400,10 @@ def _parse_response(response: Any, *, latency_ms: int, model: str) -> LLMRespons
     )
 
 
-def build_web_search_tool_param() -> dict[str, Any]:
-    """Return the `web_search` server-tool definition with the
-    project-wide configuration applied. Excluded from
-    `_build_cacheable_blocks` cache-key concerns because it's part of the
-    `tools` list — the marker still attaches to the LAST tool in the
-    final list, so this is a normal entry."""
-    return {
-        "type": "web_search_20250305",
-        "name": "web_search",
-        "max_uses": WEB_SEARCH_MAX_USES,
-        "blocked_domains": list(WEB_SEARCH_BLOCKED_DOMAINS),
-    }
-
-
 __all__ = [
-    "WEB_SEARCH_BLOCKED_DOMAINS",
-    "WEB_SEARCH_MAX_USES",
     "AnthropicLLMClient",
     "LLMCallFailure",
     "LLMClient",
     "LLMResponse",
     "LLMToolUse",
-    "build_web_search_tool_param",
 ]

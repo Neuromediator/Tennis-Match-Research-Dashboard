@@ -263,7 +263,8 @@ def test_training_features_migration_drops_v1_phase3_shape(
 
 
 def test_llm_traces_has_phase5_columns(fresh_db: duckdb.DuckDBPyConnection) -> None:
-    """Phase 5 added `web_search_count` and `estimated_cost_usd` to llm_traces."""
+    """Phase 5 added `web_search_count` and `estimated_cost_usd`; Phase 5.1
+    added `fetch_url_count`. All three must be present on a fresh build."""
     schema.create_all_tables(fresh_db)
     cols = {
         row[0]
@@ -271,13 +272,15 @@ def test_llm_traces_has_phase5_columns(fresh_db: duckdb.DuckDBPyConnection) -> N
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'llm_traces'"
         ).fetchall()
     }
-    assert {"web_search_count", "estimated_cost_usd"} <= cols
+    assert {"web_search_count", "estimated_cost_usd", "fetch_url_count"} <= cols
 
 
 def test_llm_traces_migration_adds_phase5_columns_to_legacy_table(
     fresh_db: duckdb.DuckDBPyConnection,
 ) -> None:
-    """Pre-Phase-5 llm_traces shape must be migrated in place, preserving rows."""
+    """Pre-Phase-5 llm_traces shape must be migrated in place, preserving rows.
+    Covers both the Phase 5 columns (web_search_count, estimated_cost_usd)
+    and the Phase 5.1 column (fetch_url_count)."""
     fresh_db.execute(schema.LLM_TRACES_SEQUENCE_DDL)
     fresh_db.execute(
         """
@@ -308,12 +311,52 @@ def test_llm_traces_migration_adds_phase5_columns_to_legacy_table(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'llm_traces'"
         ).fetchall()
     }
-    assert {"web_search_count", "estimated_cost_usd"} <= cols
+    assert {"web_search_count", "estimated_cost_usd", "fetch_url_count"} <= cols
 
     row = fresh_db.execute(
-        "SELECT model, web_search_count, estimated_cost_usd FROM llm_traces"
+        "SELECT model, web_search_count, estimated_cost_usd, fetch_url_count FROM llm_traces"
     ).fetchone()
-    assert row == ("legacy-row", None, None)
+    assert row == ("legacy-row", None, None, None)
+
+
+def test_llm_traces_migration_adds_fetch_url_count_to_phase5_table(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Phase-5-shape table (has web_search_count + estimated_cost_usd but no
+    fetch_url_count) must be migrated in place when create_all_tables runs."""
+    fresh_db.execute(schema.LLM_TRACES_SEQUENCE_DDL)
+    fresh_db.execute(
+        """
+        CREATE TABLE llm_traces (
+            trace_id               BIGINT PRIMARY KEY DEFAULT nextval('seq_llm_traces'),
+            ts                     TIMESTAMP NOT NULL,
+            model                  VARCHAR NOT NULL,
+            system_prompt_hash     VARCHAR,
+            input_messages         JSON,
+            tool_calls             JSON,
+            output                 JSON,
+            tokens_in              INTEGER,
+            tokens_out             INTEGER,
+            cache_read_tokens      INTEGER,
+            cache_creation_tokens  INTEGER,
+            latency_ms             INTEGER,
+            error                  VARCHAR,
+            web_search_count       INTEGER,
+            estimated_cost_usd     DOUBLE
+        )
+        """
+    )
+    fresh_db.execute(
+        "INSERT INTO llm_traces (ts, model, web_search_count, estimated_cost_usd) "
+        "VALUES (CURRENT_TIMESTAMP, 'phase5-row', 2, 0.085)"
+    )
+
+    schema.create_all_tables(fresh_db)
+
+    row = fresh_db.execute(
+        "SELECT web_search_count, estimated_cost_usd, fetch_url_count FROM llm_traces"
+    ).fetchone()
+    assert row == (2, 0.085, None)
 
 
 def test_ingestion_runs_accepts_well_formed_row(

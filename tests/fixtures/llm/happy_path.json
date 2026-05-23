@@ -1,5 +1,5 @@
 {
-  "description": "Happy path: agent calls get_player_stats + web_search then submits.",
+  "description": "Happy path (Phase 5.1): agent calls get_player_stats + Tavily web_search via client-side dispatch, then submits.",
   "responses": [
     {
       "stop_reason": "tool_use",
@@ -12,7 +12,7 @@
       "content": [
         {
           "type": "text",
-          "text": "Looking up stats for Alcaraz first."
+          "text": "Looking up stats for Alcaraz and recent news."
         },
         {
           "type": "tool_use",
@@ -25,11 +25,12 @@
           }
         },
         {
-          "type": "server_tool_use",
-          "id": "ws_1",
+          "type": "tool_use",
+          "id": "search_1",
           "name": "web_search",
           "input": {
-            "query": "Alcaraz Sinner Roland Garros 2026 form injury"
+            "query": "Alcaraz Sinner Roland Garros 2026 form injury",
+            "max_results": 5
           }
         }
       ]

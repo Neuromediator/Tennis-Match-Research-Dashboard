@@ -22,18 +22,22 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import httpx
 import pytest
+import respx
 
 from tennis_predictor.data import schema
 from tennis_predictor.data.reconcile import seed_aliases_from_players
 from tennis_predictor.llm import agent as agent_module
 from tennis_predictor.llm.agent import TennisAgent
 from tennis_predictor.llm.client import AnthropicLLMClient
+from tennis_predictor.llm.tools.fetch_url import TAVILY_EXTRACT_URL
 from tennis_predictor.llm.tools.schemas import (
     MatchContext,
     ModelFeatureSummary,
     ModelPrediction,
 )
+from tennis_predictor.llm.tools.web_search import TAVILY_SEARCH_URL
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "llm"
 
@@ -217,10 +221,36 @@ def _build_agent(conn, stub_client_responses) -> TennisAgent:
 # ---------------------------------------------------------------------------
 
 
+def _mock_tavily_search_ok(payload: dict[str, Any] | None = None) -> respx.Route:
+    """Default Tavily search response — two plausible Alcaraz/Sinner hits."""
+    default = {
+        "results": [
+            {
+                "title": "Alcaraz withdraws from Roland Garros",
+                "url": "https://example.com/alcaraz-rg-withdrawal",
+                "content": "Carlos Alcaraz pulled out of Roland Garros 2026 with a wrist injury...",
+                "published_date": "2026-05-02",
+            },
+            {
+                "title": "Sinner top seed at Paris",
+                "url": "https://example.com/sinner-paris-seed",
+                "content": "Jannik Sinner confirmed as top seed at Roland Garros 2026.",
+                "published_date": "2026-05-15",
+            },
+        ]
+    }
+    return respx.post(TAVILY_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json=payload or default)
+    )
+
+
+@respx.mock
 async def test_happy_path_fixture_replays_to_valid_agent_response(seeded_db, monkeypatch) -> None:
+    monkeypatch.setattr("tennis_predictor.llm.tools.web_search.TAVILY_API_KEY", "test-key")
     monkeypatch.setattr(
         agent_module, "get_model_prediction", lambda *a, **k: _stub_model_prediction()
     )
+    _mock_tavily_search_ok()
     agent = _build_agent(seeded_db, _load_fixture("happy_path"))
     resp = await agent.predict(_match_context())
     assert resp.confidence_band == "medium"
@@ -230,12 +260,16 @@ async def test_happy_path_fixture_replays_to_valid_agent_response(seeded_db, mon
     assert "no recent news surfaced" in resp.caveats
 
 
+@respx.mock
 async def test_web_search_error_fixture_still_produces_valid_response(
     seeded_db, monkeypatch
 ) -> None:
+    """Tavily returns 5xx → agent surfaces 'news lookup unavailable' in caveats."""
+    monkeypatch.setattr("tennis_predictor.llm.tools.web_search.TAVILY_API_KEY", "test-key")
     monkeypatch.setattr(
         agent_module, "get_model_prediction", lambda *a, **k: _stub_model_prediction()
     )
+    respx.post(TAVILY_SEARCH_URL).mock(return_value=httpx.Response(503, text="service unavailable"))
     agent = _build_agent(seeded_db, _load_fixture("web_search_error"))
     resp = await agent.predict(_match_context())
     assert resp.confidence_band == "low"
@@ -243,6 +277,7 @@ async def test_web_search_error_fixture_still_produces_valid_response(
 
 
 async def test_empty_h2h_fixture_surfaces_fresh_pairing_in_caveats(seeded_db, monkeypatch) -> None:
+    """No web_search calls in this fixture — Tavily is not touched."""
     monkeypatch.setattr(
         agent_module, "get_model_prediction", lambda *a, **k: _stub_model_prediction()
     )
@@ -252,25 +287,62 @@ async def test_empty_h2h_fixture_surfaces_fresh_pairing_in_caveats(seeded_db, mo
     assert any("head-to-head" in c.lower() for c in resp.caveats)
 
 
+@respx.mock
+async def test_fetch_url_used_fixture_dispatches_and_counts(seeded_db, monkeypatch) -> None:
+    """Phase 5.1 path: agent calls web_search, then fetch_url for one snippet
+    that needed the full body. Asserts both tools were dispatched and the
+    fetch_url_count column on the final trace row is > 0."""
+    monkeypatch.setattr("tennis_predictor.llm.tools.web_search.TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("tennis_predictor.llm.tools.fetch_url.TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr(
+        agent_module, "get_model_prediction", lambda *a, **k: _stub_model_prediction()
+    )
+    _mock_tavily_search_ok()
+    respx.post(TAVILY_EXTRACT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "url": "https://example.com/kasatkina-interview-2026",
+                        "raw_content": "Kasatkina spoke about her break and intentions to return slowly...",
+                    }
+                ],
+                "failed_results": [],
+            },
+        )
+    )
+    agent = _build_agent(seeded_db, _load_fixture("fetch_url_used"))
+    resp = await agent.predict(_match_context())
+    assert resp.confidence_band == "medium"
+    assert "fetch_url" in resp.tools_used
+    row = seeded_db.execute(
+        "SELECT max(fetch_url_count), max(web_search_count) FROM llm_traces"
+    ).fetchone()
+    assert row is not None
+    max_fetch_count, max_search_count = row
+    assert (max_fetch_count or 0) >= 1
+    assert (max_search_count or 0) >= 1
+
+
+@respx.mock
 async def test_agent_response_round_trips_through_llm_traces_output(seeded_db, monkeypatch) -> None:
     """Pulls the output JSON we logged on the final iteration and
     re-validates it through `AgentResponse` — Phase 5 acceptance
     criterion #4."""
+    monkeypatch.setattr("tennis_predictor.llm.tools.web_search.TAVILY_API_KEY", "test-key")
     monkeypatch.setattr(
         agent_module, "get_model_prediction", lambda *a, **k: _stub_model_prediction()
     )
+    _mock_tavily_search_ok()
     agent = _build_agent(seeded_db, _load_fixture("happy_path"))
     response = await agent.predict(_match_context())
-    # The final iteration's `output` column carries the assistant content list.
     rows = seeded_db.execute(
         "SELECT output FROM llm_traces ORDER BY trace_id DESC LIMIT 1"
     ).fetchall()
     assert rows, "agent should have logged at least one llm_traces row"
     parsed_output = json.loads(rows[0][0])
     assert isinstance(parsed_output, list)
-    # The submit_analysis input from the LLM must round-trip through
-    # AgentResponse together with the model probabilities the orchestrator
-    # provided.
     submit_block = next(b for b in parsed_output if b.get("type") == "tool_use")
     merged = {
         **submit_block["input"],

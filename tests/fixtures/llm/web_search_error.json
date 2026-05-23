@@ -1,27 +1,21 @@
 {
-  "description": "Degraded path: web_search returns an error block, agent surfaces 'news lookup unavailable' in caveats.",
+  "description": "Degraded path (Phase 5.1): agent calls web_search via client tool; Tavily returns an error, agent surfaces 'news lookup unavailable' in caveats.",
   "responses": [
     {
       "stop_reason": "tool_use",
       "usage": {
         "input_tokens": 200,
-        "output_tokens": 80,
+        "output_tokens": 60,
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 2000
       },
       "content": [
         {
-          "type": "server_tool_use",
-          "id": "ws_1",
+          "type": "tool_use",
+          "id": "search_err_1",
           "name": "web_search",
-          "input": {"query": "Alcaraz Sinner news 2026"}
-        },
-        {
-          "type": "web_search_tool_result",
-          "tool_use_id": "ws_1",
-          "content": {
-            "type": "web_search_tool_result_error",
-            "error_code": "unavailable"
+          "input": {
+            "query": "Alcaraz Sinner news 2026"
           }
         }
       ]

@@ -1,0 +1,75 @@
+{
+  "description": "Phase 5.1: snippet hints at an important detail, agent calls fetch_url to retrieve the full article, then submits.",
+  "responses": [
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 200,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 2000
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "search_1",
+          "name": "web_search",
+          "input": {
+            "query": "Kasatkina return interview WTA 2026"
+          }
+        }
+      ]
+    },
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 350,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 0
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "The snippet truncates the interview detail; fetching the full article for context."
+        },
+        {
+          "type": "tool_use",
+          "id": "fetch_1",
+          "name": "fetch_url",
+          "input": {
+            "url": "https://example.com/kasatkina-interview-2026"
+          }
+        }
+      ]
+    },
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 1200,
+        "output_tokens": 250,
+        "cache_read_input_tokens": 2000,
+        "cache_creation_input_tokens": 0
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "submit_3",
+          "name": "submit_analysis",
+          "input": {
+            "key_factors": [
+              "Kasatkina cited mental health break in recent interview",
+              "Returning to tour with reduced match volume"
+            ],
+            "narrative": "Kasatkina's full interview confirmed an intentional one-month pause and a measured return. Treat surface-Elo at face value but expect the win-rate-last-10 signal to lag her actual form for several weeks. The probability is well-supported by surface and ranking but caveat the recent-form input.",
+            "confidence_band": "medium",
+            "caveats": [
+              "Kasatkina returning from extended break — last-10 form signal lags"
+            ],
+            "tools_used": ["get_model_prediction", "web_search", "fetch_url"]
+          }
+        }
+      ]
+    }
+  ]
+}

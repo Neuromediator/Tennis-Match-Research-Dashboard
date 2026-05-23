@@ -79,9 +79,13 @@ def test_should_force_submit_when_token_buffer_hit() -> None:
 
 
 def test_should_force_submit_when_web_searches_exhausted() -> None:
+    """Phase 5.1: web_search count comes from agent-side reservation,
+    not from `response.web_search_count` (that was a Phase 5 native-tool
+    accounting path; the Phase 5.1 client tool reserves atomically)."""
     budget = AgentBudget(max_web_searches=2)
     tracker = BudgetTracker(budget)
-    tracker.register_iteration(_response(web_searches=2))
+    tracker.reserve_web_search()
+    tracker.reserve_web_search()
     assert tracker.should_force_submit() is True
 
 
@@ -114,11 +118,16 @@ def test_check_within_limits_raises_on_token_overflow() -> None:
         tracker.register_iteration(_response(tokens_in=2_000))
 
 
-def test_check_within_limits_raises_on_web_search_overflow() -> None:
+def test_check_within_limits_raises_on_web_search_overflow_via_manual_increment() -> None:
+    """If the count somehow exceeds the cap (e.g. a future bug bypasses
+    reserve), check_within_limits is the second wall and raises. Reach
+    the overflow state manually since `reserve_web_search` would have
+    refused at the 2nd call."""
     budget = AgentBudget(max_web_searches=1)
     tracker = BudgetTracker(budget)
+    tracker.web_searches_used = 2  # simulate a leak past reserve
     with pytest.raises(BudgetExceededError, match="max_web_searches"):
-        tracker.register_iteration(_response(web_searches=2))
+        tracker.check_within_limits()
 
 
 def test_check_within_limits_raises_on_wall_clock_overflow() -> None:
@@ -130,9 +139,80 @@ def test_check_within_limits_raises_on_wall_clock_overflow() -> None:
 
 
 def test_remaining_helpers_decrement_from_full_budget() -> None:
+    """`register_iteration` decrements iteration + token budgets;
+    `reserve_web_search` is the path that decrements the web_search
+    budget (Phase 5.1 separation)."""
     budget = AgentBudget(max_tool_iterations=6, max_total_tokens=30_000, max_web_searches=3)
     tracker = BudgetTracker(budget)
-    tracker.register_iteration(_response(tokens_in=500, tokens_out=200, web_searches=1))
+    tracker.register_iteration(_response(tokens_in=500, tokens_out=200))
+    tracker.reserve_web_search()
     assert tracker.iterations_remaining() == 5
     assert tracker.tokens_remaining() == 30_000 - 700
     assert tracker.web_searches_remaining() == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.1 additions: register_tool_search / register_tool_fetch + pending
+# cost accounting consumed by the next LLM call.
+# ---------------------------------------------------------------------------
+
+
+def test_reserve_web_search_increments_count_and_pending() -> None:
+    tracker = BudgetTracker(AgentBudget())
+    assert tracker.reserve_web_search() is True
+    assert tracker.reserve_web_search() is True
+    assert tracker.web_searches_used == 2
+    assert tracker.pending_web_searches == 2
+    tracker.register_tool_search(cost_usd=0.005)
+    tracker.register_tool_search(cost_usd=0.005)
+    assert tracker.pending_tool_cost_usd == pytest.approx(0.010)
+
+
+def test_reserve_web_search_returns_false_when_exhausted() -> None:
+    """Atomic reservation gate — prevents parallel dispatches from
+    overshooting the cap."""
+    tracker = BudgetTracker(AgentBudget(max_web_searches=2))
+    assert tracker.reserve_web_search() is True
+    assert tracker.reserve_web_search() is True
+    assert tracker.reserve_web_search() is False
+    assert tracker.web_searches_used == 2
+
+
+def test_reserve_fetch_url_returns_false_when_exhausted() -> None:
+    tracker = BudgetTracker(AgentBudget(max_fetch_urls=1))
+    assert tracker.reserve_fetch_url() is True
+    assert tracker.reserve_fetch_url() is False
+    assert tracker.fetch_urls_used == 1
+
+
+def test_refund_web_search_returns_slot() -> None:
+    tracker = BudgetTracker(AgentBudget(max_web_searches=1))
+    tracker.reserve_web_search()
+    tracker.refund_web_search()
+    assert tracker.web_searches_used == 0
+    assert tracker.reserve_web_search() is True
+
+
+def test_consume_pending_returns_and_resets() -> None:
+    tracker = BudgetTracker(AgentBudget())
+    tracker.reserve_web_search()
+    tracker.register_tool_search(cost_usd=0.005)
+    tracker.reserve_fetch_url()
+    tracker.register_tool_fetch(cost_usd=0.005)
+    cost, searches, fetches = tracker.consume_pending()
+    assert cost == pytest.approx(0.010)
+    assert searches == 1
+    assert fetches == 1
+    # Pending zeroed; cumulative usage counters untouched.
+    assert tracker.pending_tool_cost_usd == 0.0
+    assert tracker.pending_web_searches == 0
+    assert tracker.pending_fetch_urls == 0
+    assert tracker.web_searches_used == 1
+    assert tracker.fetch_urls_used == 1
+
+
+def test_fetch_urls_remaining_decrements() -> None:
+    tracker = BudgetTracker(AgentBudget(max_fetch_urls=2))
+    assert tracker.fetch_urls_remaining() == 2
+    tracker.reserve_fetch_url()
+    assert tracker.fetch_urls_remaining() == 1

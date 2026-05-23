@@ -24,7 +24,6 @@ from tennis_predictor.data import schema
 from tennis_predictor.llm.client import (
     AnthropicLLMClient,
     LLMCallFailure,
-    build_web_search_tool_param,
 )
 
 # ---------------------------------------------------------------------------
@@ -100,13 +99,22 @@ class _StubAsyncAnthropic:
 
 
 def _basic_tools() -> list[dict[str, Any]]:
+    """Two-tool fixture used by the cacheable-prefix tests. The previous
+    Phase 5 version included an Anthropic-native web_search; Phase 5.1
+    removed that helper (web_search is a Tavily-backed client tool now)
+    so we just use plain stand-ins here — the byte-stability test is
+    indifferent to the actual tool shapes."""
     return [
         {
             "name": "tool_one",
             "description": "x",
             "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
-        build_web_search_tool_param(),
+        {
+            "name": "tool_mid",
+            "description": "stand-in for the middle tool slot",
+            "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
         {
             "name": "tool_last",
             "description": "y",
@@ -234,7 +242,12 @@ async def test_acall_parses_tool_uses_and_text(fresh_db) -> None:
     assert response.text == "Thinking..."
     assert len(response.tool_uses) == 1
     assert response.tool_uses[0].name == "get_player_stats"
-    assert response.web_search_count == 1
+    # Phase 5.1: web_search is no longer Anthropic-native, so a stray
+    # server_tool_use=web_search block is recorded but NOT counted toward
+    # web_search_count. That counter now reflects client-side dispatch
+    # only (the agent loop calls register_tool_search via Tavily).
+    assert response.web_search_count == 0
+    assert "web_search" in response.server_tool_uses
     assert response.cache_read_tokens == 1800
     assert response.estimated_cost_usd > 0
     assert response.trace_id is not None

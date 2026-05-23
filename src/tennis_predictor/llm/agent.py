@@ -38,7 +38,6 @@ from tennis_predictor.llm.client import (
     LLMClient,
     LLMResponse,
     LLMToolUse,
-    build_web_search_tool_param,
 )
 from tennis_predictor.llm.tools.db_tools import (
     get_head_to_head,
@@ -46,8 +45,14 @@ from tennis_predictor.llm.tools.db_tools import (
     get_player_stats,
     get_recent_form,
 )
+from tennis_predictor.llm.tools.fetch_url import (
+    FETCH_URL_TOOL,
+    FETCH_URL_TOOL_NAME,
+    fetch_url,
+)
 from tennis_predictor.llm.tools.model_tool import get_model_prediction
 from tennis_predictor.llm.tools.schemas import (
+    FetchUrlInput,
     GetHeadToHeadInput,
     GetModelPredictionInput,
     GetPlayerRankingInput,
@@ -57,11 +62,18 @@ from tennis_predictor.llm.tools.schemas import (
     ModelPrediction,
     ModelUnavailableError,
     PlayerResolutionError,
+    TavilyError,
+    WebSearchInput,
 )
 from tennis_predictor.llm.tools.submit import (
     SUBMIT_ANALYSIS_TOOL,
     SUBMIT_ANALYSIS_TOOL_NAME,
     AgentResponse,
+)
+from tennis_predictor.llm.tools.web_search import (
+    WEB_SEARCH_TOOL,
+    WEB_SEARCH_TOOL_NAME,
+    search_web,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,13 +97,19 @@ class AgentBudget:
     """Per-`predict()` hard limits.
 
     The defaults come from CLAUDE.md "Budget discipline" and are tuned for
-    Sonnet 4.6 with ~2000-token cacheable prefix. Override at construction
-    time only for scoped experiments; never inline."""
+    Sonnet 4.6 with ~2250-token cacheable prefix (Phase 5.1 added the two
+    new Tavily tools, ~250 tokens). Override at construction time only for
+    scoped experiments; never inline.
+
+    Phase 5.1 added `max_fetch_urls` — separate from `max_web_searches`
+    because they're different kinds of action with different cost profiles
+    (snippet vs full body extraction)."""
 
     max_tool_iterations: int = 6
     max_total_tokens: int = 30_000
     max_wall_clock_seconds: float = 120.0
     max_web_searches: int = 3
+    max_fetch_urls: int = 2
     output_max_tokens: int = 1500
 
 
@@ -115,6 +133,13 @@ class BudgetTracker:
     iterations_used: int = 0
     tokens_used: int = 0
     web_searches_used: int = 0
+    fetch_urls_used: int = 0
+    # Phase 5.1: Tavily costs accumulated between LLM calls. Consumed on
+    # the next acall() so the trace row reflects the iteration's full cost
+    # picture (Anthropic line items + Tavily charges).
+    pending_tool_cost_usd: float = 0.0
+    pending_web_searches: int = 0
+    pending_fetch_urls: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
     # ------------------------------------------------------------------
@@ -128,12 +153,74 @@ class BudgetTracker:
         # The org-level $20/month hard cap remains the real wall — this
         # is just per-call sanity. Live `llm_traces.estimated_cost_usd`
         # captures the full picture for the dashboard.
+        #
+        # Phase 5.1 note: `web_searches_used` and `fetch_urls_used` are
+        # tracked exclusively by the agent's `reserve_*` reservations.
+        # `response.web_search_count` here would double-count (it already
+        # includes the agent's extras merged in by `LLMClient.acall`), so
+        # this method does NOT touch those counters.
         self.iterations_used += 1
         self.tokens_used += (
             response.tokens_in + response.tokens_out + response.cache_creation_tokens
         )
-        self.web_searches_used += response.web_search_count
         self.check_within_limits()
+
+    def reserve_web_search(self) -> bool:
+        """Atomically reserve a web_search slot. Returns True on success.
+
+        Reservation is a single sync step (asyncio is single-threaded so
+        no race between read + write) — `_dispatch_tool` calls this
+        BEFORE awaiting Tavily so parallel dispatches in one turn can't
+        all see the same `web_searches_remaining` and overshoot.
+        """
+        if self.web_searches_used >= self.budget.max_web_searches:
+            return False
+        self.web_searches_used += 1
+        self.pending_web_searches += 1
+        return True
+
+    def reserve_fetch_url(self) -> bool:
+        """Atomic counterpart for fetch_url — same rationale."""
+        if self.fetch_urls_used >= self.budget.max_fetch_urls:
+            return False
+        self.fetch_urls_used += 1
+        self.pending_fetch_urls += 1
+        return True
+
+    def register_tool_search(self, cost_usd: float) -> None:
+        """Record cost of one already-reserved web_search dispatch. Count
+        is incremented separately by `reserve_web_search`."""
+        self.pending_tool_cost_usd += cost_usd
+        self.check_within_limits()
+
+    def register_tool_fetch(self, cost_usd: float) -> None:
+        """Record cost of one already-reserved fetch_url dispatch."""
+        self.pending_tool_cost_usd += cost_usd
+        self.check_within_limits()
+
+    def refund_web_search(self) -> None:
+        """Undo a reservation when the Tavily call failed before incurring
+        any cost (e.g., raised before reaching the API)."""
+        self.web_searches_used -= 1
+        self.pending_web_searches -= 1
+
+    def refund_fetch_url(self) -> None:
+        """Undo a fetch_url reservation."""
+        self.fetch_urls_used -= 1
+        self.pending_fetch_urls -= 1
+
+    def consume_pending(self) -> tuple[float, int, int]:
+        """Return (cost_usd, web_search_count, fetch_url_count) accumulated
+        since the last LLM call, and reset the pending counters. Called
+        right before `LLMClient.acall()` so the trace row attributes the
+        Tavily activity to the iteration it preceded."""
+        cost = self.pending_tool_cost_usd
+        searches = self.pending_web_searches
+        fetches = self.pending_fetch_urls
+        self.pending_tool_cost_usd = 0.0
+        self.pending_web_searches = 0
+        self.pending_fetch_urls = 0
+        return cost, searches, fetches
 
     # ------------------------------------------------------------------
 
@@ -152,15 +239,18 @@ class BudgetTracker:
     def web_searches_remaining(self) -> int:
         return self.budget.max_web_searches - self.web_searches_used
 
+    def fetch_urls_remaining(self) -> int:
+        return self.budget.max_fetch_urls - self.fetch_urls_used
+
     # ------------------------------------------------------------------
 
     def should_force_submit(self) -> bool:
         """True when the next call should hard-force `submit_analysis`.
 
         We force one iteration early so the LLM doesn't get cut off
-        mid-thought. The web-search exhaustion case also forces submit
-        — if the agent has used all 3 searches, more data tools won't
-        help and we want it to wrap up."""
+        mid-thought. Web-search and fetch-url exhaustion also force
+        submit — if the agent has used all of either, more data tools
+        won't help and we want it to wrap up."""
         return (
             self.iterations_remaining() <= 1
             or self.tokens_remaining() <= _FORCE_SUBMIT_TOKEN_BUFFER
@@ -183,6 +273,10 @@ class BudgetTracker:
             raise BudgetExceededError(
                 f"max_web_searches exceeded: {self.web_searches_used} > "
                 f"{self.budget.max_web_searches}"
+            )
+        if self.fetch_urls_used > self.budget.max_fetch_urls:
+            raise BudgetExceededError(
+                f"max_fetch_urls exceeded: {self.fetch_urls_used} > {self.budget.max_fetch_urls}"
             )
         if self.wall_clock_elapsed() > self.budget.max_wall_clock_seconds:
             raise BudgetExceededError(
@@ -318,12 +412,20 @@ class TennisAgent:
                 if tracker.should_force_submit()
                 else {"type": "auto"}
             )
+            # Hand off the Tavily activity that happened since the last LLM
+            # call so the trace row reflects it. consume_pending zeros the
+            # counters; if the LLM call fails the cost is logged on the
+            # error trace row.
+            pending_cost, pending_searches, pending_fetches = tracker.consume_pending()
             try:
                 response = await self._llm.acall(
                     messages=messages,
                     tools=tools,
                     tool_choice=tool_choice,
                     max_tokens=self._budget.output_max_tokens,
+                    extra_tool_cost_usd=pending_cost,
+                    extra_web_search_count=pending_searches,
+                    extra_fetch_url_count=pending_fetches,
                 )
             except LLMCallFailure as exc:
                 raise AgentError(f"LLM call failed: {exc}") from exc
@@ -350,37 +452,98 @@ class TennisAgent:
                 )
                 continue
 
-            # Append the assistant turn (verbatim, including server_tool_use
-            # blocks which Anthropic re-checks on the next request) and
-            # dispatch each client-side tool call.
+            # Append the assistant turn verbatim and dispatch every
+            # client-side tool call concurrently. Tavily HTTP dominates
+            # the dispatch latency, so parallel makes a real difference
+            # when the LLM asks for stats + H2H + web_search in one turn.
             messages.append({"role": "assistant", "content": response.raw_content})
-            tool_result_blocks = [self._dispatch_tool(ctx, use) for use in other_uses]
-            messages.append({"role": "user", "content": tool_result_blocks})
+            tool_result_blocks = await asyncio.gather(
+                *[self._dispatch_tool(ctx, use, tracker) for use in other_uses]
+            )
+            blocks = list(tool_result_blocks)
+            # Phase 5.1 rolling cache: drop a `cache_control` marker on the
+            # LAST tool_result block, BUT only when we expect at least one
+            # more data-gathering iteration. Empirically (live smoke
+            # 2026-05-23) this saves ~$0.02 per multi-iteration predict;
+            # skipping the marker on the iteration that's about to
+            # force-submit avoids paying ~$0.02-0.05 of cache_creation
+            # surcharge for content that's never read back from cache.
+            if blocks and not tracker.should_force_submit():
+                blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            messages.append({"role": "user", "content": blocks})
 
     # ------------------------------------------------------------------
     # Tool dispatch
     # ------------------------------------------------------------------
 
-    def _dispatch_tool(self, ctx: MatchContext, use: LLMToolUse) -> dict[str, Any]:
+    async def _dispatch_tool(
+        self,
+        ctx: MatchContext,
+        use: LLMToolUse,
+        tracker: BudgetTracker,
+    ) -> dict[str, Any]:
         """Run one client-side tool and return the `tool_result` block
-        that goes back to the model on the next turn. DB tool exceptions
-        bubble (Hard rule from CLAUDE.md failure-mode 3); only
-        `PlayerResolutionError` is caught and returned as a tool error so
-        the LLM can mention the unresolved name in `caveats`."""
+        that goes back to the model on the next turn.
+
+        Pre-flight budget check: if dispatching this tool would push the
+        agent over its per-call cap (`max_web_searches`, `max_fetch_urls`),
+        refuse without calling the vendor. The LLM gets an `is_error`
+        tool_result explaining the limit so it can adapt on the next turn
+        (typically by calling `submit_analysis`). Without this gate, a
+        single LLM turn requesting N+1 searches would crash the loop with
+        a `BudgetExceededError`.
+
+        Three error families that fall through to soft failure:
+        - `PlayerResolutionError` (DB tools) — name not in `player_aliases`.
+        - `TavilyError` (web_search / fetch_url) — Tavily HTTP failure.
+        - Pre-flight budget refusal — message tells the LLM what to do next.
+
+        Other exceptions bubble (programming bugs, CLAUDE.md failure-mode #3).
+        """
+        # Pre-flight: ATOMICALLY reserve a Tavily budget slot. asyncio is
+        # single-threaded so reserve_* is race-free; this gates parallel
+        # tool dispatches in a single turn from overshooting the cap.
+        if use.name == WEB_SEARCH_TOOL_NAME and not tracker.reserve_web_search():
+            return _error_block(
+                use,
+                "web_search budget exhausted for this prediction "
+                f"({tracker.budget.max_web_searches} calls used). "
+                "Call `submit_analysis` next with what you have.",
+            )
+        if use.name == FETCH_URL_TOOL_NAME and not tracker.reserve_fetch_url():
+            return _error_block(
+                use,
+                "fetch_url budget exhausted for this prediction "
+                f"({tracker.budget.max_fetch_urls} calls used). "
+                "Call `submit_analysis` next with what you have.",
+            )
+
         try:
-            result = _run_client_tool(self._conn, ctx, use)
-        except PlayerResolutionError as exc:
-            return {
-                "type": "tool_result",
-                "tool_use_id": use.id,
-                "is_error": True,
-                "content": [{"type": "text", "text": str(exc)}],
-            }
+            result = await _run_client_tool(self._conn, ctx, use, tracker)
+        except (PlayerResolutionError, TavilyError) as exc:
+            # Tavily failed — refund the reservation so a retry could go
+            # through (LLM unlikely to retry the same query, but the budget
+            # accounting stays honest).
+            if use.name == WEB_SEARCH_TOOL_NAME:
+                tracker.refund_web_search()
+            elif use.name == FETCH_URL_TOOL_NAME:
+                tracker.refund_fetch_url()
+            return _error_block(use, str(exc))
         return {
             "type": "tool_result",
             "tool_use_id": use.id,
             "content": [{"type": "text", "text": result}],
         }
+
+
+def _error_block(use: LLMToolUse, message: str) -> dict[str, Any]:
+    """Standard tool_result shape for a soft-failure case."""
+    return {
+        "type": "tool_result",
+        "tool_use_id": use.id,
+        "is_error": True,
+        "content": [{"type": "text", "text": message}],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -389,20 +552,27 @@ class TennisAgent:
 
 
 # Pydantic input models per tool — used to validate the LLM's JSON before
-# we touch the DB. Order doesn't matter for cache hashing because the
-# `tools` list (built below) IS what gets hashed.
+# dispatch. Order doesn't matter for cache hashing because the `tools`
+# list (built below) IS what gets hashed.
 _CLIENT_TOOL_INPUT_MODELS = {
     "get_player_stats": GetPlayerStatsInput,
     "get_head_to_head": GetHeadToHeadInput,
     "get_recent_form": GetRecentFormInput,
     "get_player_ranking": GetPlayerRankingInput,
+    WEB_SEARCH_TOOL_NAME: WebSearchInput,
+    FETCH_URL_TOOL_NAME: FetchUrlInput,
 }
 
 
 def _build_tools_list() -> list[dict[str, Any]]:
     """Compose the full tool list. Order matters for cache hashing — the
     LAST tool gets the `cache_control` marker in `LLMClient`, so keep
-    `submit_analysis` last and the rest in a stable order."""
+    `submit_analysis` last and the rest in a stable order.
+
+    Phase 5.1 added Tavily-backed `web_search` and `fetch_url` as
+    client-side tools (replacing Anthropic's server-side native search).
+    They sit between the DB tools and `submit_analysis` so the cache
+    marker still lands on a stable tool definition."""
     return [
         {
             "name": "get_player_stats",
@@ -436,7 +606,8 @@ def _build_tools_list() -> list[dict[str, Any]]:
             ),
             "input_schema": _strip_default_keys(GetPlayerRankingInput.model_json_schema()),
         },
-        build_web_search_tool_param(),
+        WEB_SEARCH_TOOL,
+        FETCH_URL_TOOL,
         SUBMIT_ANALYSIS_TOOL,
     ]
 
@@ -496,12 +667,23 @@ def _partition_tool_uses(
     return submit, others
 
 
-def _run_client_tool(
+async def _run_client_tool(
     conn: duckdb.DuckDBPyConnection,
     ctx: MatchContext,
     use: LLMToolUse,
+    tracker: BudgetTracker,
 ) -> str:
-    """Validate the LLM's JSON, run the tool, JSON-encode the result."""
+    """Validate the LLM's JSON, run the tool, JSON-encode the result.
+
+    DB tools are synchronous (DuckDB is in-process); Tavily tools are
+    async (HTTP). Async signature lets `_dispatch_tool` run multiple
+    tools concurrently via `asyncio.gather`.
+
+    `tracker` is mutated for Tavily tools (search/fetch budget + pending
+    cost accounting). DB tools don't touch the tracker — they're free
+    and not separately budgeted (they count via `register_iteration`
+    which sees the overall token usage).
+    """
     if use.name not in _CLIENT_TOOL_INPUT_MODELS:
         raise AgentError(f"unknown tool {use.name!r}")
 
@@ -525,6 +707,16 @@ def _run_client_tool(
     if use.name == "get_player_ranking":
         assert isinstance(validated, GetPlayerRankingInput)
         return get_player_ranking(conn, validated).model_dump_json()
+    if use.name == WEB_SEARCH_TOOL_NAME:
+        assert isinstance(validated, WebSearchInput)
+        result = await search_web(validated)
+        tracker.register_tool_search(result.cost_usd)
+        return result.model_dump_json()
+    if use.name == FETCH_URL_TOOL_NAME:
+        assert isinstance(validated, FetchUrlInput)
+        result = await fetch_url(validated)
+        tracker.register_tool_fetch(result.cost_usd)
+        return result.model_dump_json()
     raise AgentError(f"unhandled tool {use.name!r}")  # unreachable
 
 

@@ -150,7 +150,8 @@ CREATE TABLE IF NOT EXISTS llm_traces (
     latency_ms             INTEGER,
     error                  VARCHAR,
     web_search_count       INTEGER,
-    estimated_cost_usd     DOUBLE
+    estimated_cost_usd     DOUBLE,
+    fetch_url_count        INTEGER
 );
 """
 
@@ -429,12 +430,15 @@ def _migrate_training_features(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute("DROP TABLE training_features")
 
 
-# Phase 5 columns added to `llm_traces`. Listed as (column_name, DDL_type)
+# Phase 5+ columns added to `llm_traces`. Listed as (column_name, DDL_type)
 # tuples so the migration helper can ALTER an existing table without doing
 # a full drop-and-recreate (the table accumulates user-visible history).
+# - web_search_count / estimated_cost_usd added in Phase 5.
+# - fetch_url_count added in Phase 5.1 (Tavily Extract follow-up tool).
 _LLM_TRACES_PHASE5_COLUMNS: tuple[tuple[str, str], ...] = (
     ("web_search_count", "INTEGER"),
     ("estimated_cost_usd", "DOUBLE"),
+    ("fetch_url_count", "INTEGER"),
 )
 
 

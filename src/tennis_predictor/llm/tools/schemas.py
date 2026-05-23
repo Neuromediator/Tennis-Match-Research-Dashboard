@@ -326,3 +326,83 @@ class ModelUnavailableError(Exception):
     `predict_proba` call fails for any reason. CLAUDE.md hard rule #10:
     the LLM agent MUST NOT be invoked when this fires. The CLI catches
     it before the agent loop starts."""
+
+
+class TavilyError(Exception):
+    """Raised by `web_search` / `fetch_url` on any Tavily HTTP failure
+    (5xx, 4xx, JSON parse error). Caught by the agent loop and surfaced
+    as a tool_result error block so the LLM can mention the lookup
+    failure in `caveats` — CLAUDE.md failure-mode #1 (web search error)
+    and #7 (fetch_url error)."""
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.1: web_search and fetch_url — Tavily-backed client-side tools.
+# Replaces Anthropic native `web_search_20250305` (Phase 5).
+# ---------------------------------------------------------------------------
+
+
+class WebSearchInput(BaseModel):
+    """LLM-supplied arguments for one Tavily search.
+
+    `max_results` is bounded at 10 — Tavily's basic plan returns up to 10
+    per call and going higher just costs us more without surfacing
+    additional value (the agent rarely uses beyond the top 5)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    query: str = Field(min_length=1, max_length=500)
+    max_results: int = Field(default=5, ge=1, le=10)
+
+
+class WebSearchHit(BaseModel):
+    """One result row in `WebSearchOutput.results`. Snippet is the cleaned
+    text fragment Tavily returns (~150-300 chars). Anthropic's native
+    search hid this in `encrypted_content`; Tavily exposes it so the
+    `llm_traces` dashboard can show the actual content the agent saw."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    title: str
+    url: str
+    snippet: str
+    # Tavily returns ISO-8601 strings when known; left as `str | None`
+    # rather than `date | None` because the field is heuristic (Tavily
+    # parses publication timestamps from page meta, occasionally wrong).
+    published_date: str | None = None
+
+
+class WebSearchOutput(BaseModel):
+    """Output of `web_search`. `cost_usd` is the per-call Tavily charge,
+    accumulated by the agent loop into `llm_traces.estimated_cost_usd`
+    alongside the Anthropic line items."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    query: str
+    results: list[WebSearchHit] = Field(default_factory=list)
+    cost_usd: float = Field(ge=0.0)
+
+
+class FetchUrlInput(BaseModel):
+    """LLM-supplied URL for the `fetch_url` tool. Used when a `web_search`
+    snippet truncates an important detail and the agent wants the cleaned
+    full article body — see CLAUDE.md "Phase 5.1" guidance."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class FetchUrlOutput(BaseModel):
+    """Output of `fetch_url`. `content` is the cleaned article body Tavily
+    Extract returns (typically 2-5k chars). `extraction_success` is False
+    on paywalls / JS-rendered SPAs Tavily can't parse — the agent should
+    mention that in `caveats` rather than fabricating around the empty body."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str
+    content: str
+    extraction_success: bool
+    cost_usd: float = Field(ge=0.0)

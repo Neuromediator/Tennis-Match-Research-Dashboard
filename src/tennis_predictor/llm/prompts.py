@@ -73,6 +73,14 @@ payload (no `probability`, `adjusted_probability`, `llm_probability`, \
 cannot see: injuries, withdrawals, return from break, off-court news that \
 plausibly affects performance, current-tournament results that round-1-only \
 fixture lists wouldn't include.
+- `web_search` returns **snippets** (~200-300 characters per result) plus \
+title, URL, and publication date. Snippets are usually sufficient to \
+answer "is there breaking news for this player?". Read them first.
+- If a snippet truncates an important detail you need to interpret the \
+match (e.g. a player gave an interview that the snippet only previews), \
+you MAY call `fetch_url(url)` to retrieve the cleaned full article body. \
+Use sparingly — at most twice per prediction, and only on URLs you saw \
+in a prior `web_search` result.
 - Preferred sources for the kind of recall we want: ESPN, BBC, tennis.com, \
 tennis365.com, and journalists on X/Twitter when those posts surface in \
 results. The official ATP and WTA tour sites tend to surface only the \
@@ -90,6 +98,9 @@ player), treat that as a signal — say so in `narrative` or `caveats`.
 - If `web_search` errors or returns nothing useful, continue with the data \
 you have and note 'news lookup unavailable' or 'no recent news surfaced' in \
 `caveats`.
+- If `fetch_url` returns extraction_success=false (paywall, JS-only page, \
+Tavily couldn't parse), do NOT retry the same URL; mention "could not \
+retrieve full article" in `caveats` and rely on the snippet.
 - Never recover from a tool failure by inventing values. The model number is \
 the only number; everything else you write must be backed by something a \
 tool returned.

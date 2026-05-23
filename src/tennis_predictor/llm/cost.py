@@ -70,7 +70,16 @@ ANTHROPIC_PRICING: dict[str, _ModelPricing] = {
 }
 
 # Anthropic native web_search: ~$10 per 1000 searches as of 2026-05-22.
+# Phase 5.1 swapped to Tavily; this constant stays for back-compat / dashboard
+# math against pre-5.1 `llm_traces` rows.
 WEB_SEARCH_USD_PER_CALL: float = 0.010
+
+# Phase 5.1: Tavily snippet-only search + Extract for follow-up fetches.
+# Both are charged at $0.005 per query on the paid plan; the free tier
+# (1000/month) hides the cost. Numbers below are the paid-plan rate so the
+# dashboard surfaces what the workload WOULD cost outside the free tier.
+TAVILY_BASIC_USD_PER_QUERY: float = 0.005
+TAVILY_EXTRACT_USD_PER_QUERY: float = 0.005
 
 
 def _resolve_pricing(model: str) -> _ModelPricing:
@@ -135,6 +144,8 @@ def cache_hit_rate(
 
 __all__ = [
     "ANTHROPIC_PRICING",
+    "TAVILY_BASIC_USD_PER_QUERY",
+    "TAVILY_EXTRACT_USD_PER_QUERY",
     "WEB_SEARCH_USD_PER_CALL",
     "cache_hit_rate",
     "estimate_call_cost",
