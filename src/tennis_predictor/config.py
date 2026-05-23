@@ -28,3 +28,9 @@ ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 # matchstat Tennis API on RapidAPI ("Tennis API - ATP WTA ITF"), free tier 500 req/month.
 X_RAPIDAPI_KEY: str | None = os.environ.get("X_RAPIDAPI_KEY")
+
+# Tavily snippet-only search API. Phase 5 uses Anthropic native web_search; this
+# key is used by scripts/compare_search_providers.py to A/B test whether Tavily
+# can replace native search at ~5x lower cost without quality loss. Free tier:
+# 1000 searches/month, no card.
+TAVILY_API_KEY: str | None = os.environ.get("TAVILY_API_KEY")

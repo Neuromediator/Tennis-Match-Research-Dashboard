@@ -242,6 +242,31 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
+## Phase 5.1 — Search provider swap (planned)
+
+**Entry:** Phase 5 complete. Full design document: `docs/tutorials/phase_5_1_notes.md`.
+
+**Motivation.** Phase 5 closed with observed cost of ~$0.10 / prediction, ~3× the pre-implementation estimate. The driver is Anthropic native `web_search` returning full page bodies (~14k tokens of `cache_creation` per call) most of which the agent does not read past the first paragraph. An A/B test (`scripts/compare_search_providers.py`) on 2026-05-23 showed Tavily snippet-only search is 9.5× cheaper / 3.5× faster, surfaces the same niche journalism (Kasatkina, Tatjana Maria) at parity, and naturally returns the diverse non-official sources CLAUDE.md "Web search" prefers.
+
+**Deliverables (planned):**
+- New `src/tennis_predictor/llm/tools/web_search.py` — Tavily wrapper + tool definition. Replaces Anthropic native `web_search_20250305`.
+- New `src/tennis_predictor/llm/tools/fetch_url.py` — Tavily Extract for the ~5% case where snippets truncate a key detail. `max_fetch_urls = 2` per call.
+- Pydantic schemas: `WebSearchInput / Hit / Output`, `FetchUrlInput / Output`.
+- `llm_traces` migration: new `fetch_url_count INTEGER` column.
+- Tier-1 unit tests + Tier-2 re-recorded fixtures + Tier-3 live smoke confirming the cost target.
+- Cache-prefix digest rebaselined (one-time miss on first call after deploy).
+
+**Exit (target):**
+- Cost per prediction ≤ $0.04 (down from $0.10), documented in `docs/tutorials/phase_5_1_results.md` across ~10 sample predictions.
+- Quality parity: no regression in `key_factors` / `caveats` quality on the A/B test query set.
+- All three test tiers green.
+
+**Out of scope (intentional):**
+- Twitter/X granularity. Neither Anthropic native nor Tavily solves "Djokovic missed morning training" — that requires separate X API integration ($200/month) deferred indefinitely.
+- Tavily `search_depth: "advanced"`. Basic-tier ranking is adequate per the A/B test; advanced is a future fallback if quality regresses.
+
+---
+
 ## Phase 6 — Streamlit app
 
 **Entry:** phase 5 exit criteria met.
