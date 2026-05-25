@@ -16,16 +16,76 @@ write the totals into `ingestion_runs`.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import duckdb
 
-from tennis_predictor.data.matchstat import Fixture, Match, RankingEntry
+from tennis_predictor.data.matchstat import (
+    Fixture,
+    Match,
+    RankingEntry,
+    fixture_on_court_time,
+    is_day_level_placeholder,
+)
 
 SOURCE_MATCHSTAT = "matchstat"
 ODDS_SOURCE_MATCHSTAT = "matchstat"
+
+# matchstat returns ISO-8601 with a `Z` suffix that is empirically NOT
+# real UTC: user-confirmed 2026-05-24 that fixtures appearing as e.g.
+# `2026-05-25T12:00:00.000Z` are actually 09:00 real UTC (a +3 hour
+# shift). The most plausible cause is matchstat's backend storing times
+# in Moscow time (UTC+3) and mislabeling them as `Z`. To recover real
+# UTC we re-interpret the labelled `Z` as `MATCHSTAT_SOURCE_TZ` and
+# convert.
+#
+# Phase 6.1 default change: `Europe/Moscow` (was `UTC` in Phase 6).
+# The +3h shift is empirically consistent across non-Moscow tournaments
+# (Roland Garros, etc.), so we default to undoing it for everyone.
+# Override via env var if matchstat fixes their labelling. Read inside
+# the helper on each call so monkeypatch.setenv in tests (and a manual
+# export at runtime) takes effect without a module reload.
+_MATCHSTAT_SOURCE_TZ_DEFAULT: str = "Europe/Moscow"
+
+
+def _matchstat_source_tz() -> ZoneInfo:
+    name = os.environ.get("MATCHSTAT_SOURCE_TZ", _MATCHSTAT_SOURCE_TZ_DEFAULT)
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        # Bad env value -> silently fall back to UTC rather than crash
+        # the refresh script. The fix will be obvious in the displayed
+        # times still being wrong; better than a refresh that errors.
+        return ZoneInfo("UTC")
+
+
+def _to_naive_utc(dt: datetime | None) -> datetime | None:
+    """Normalize a matchstat-supplied datetime to naive real-UTC.
+
+    Two distinct corrections happen here:
+
+    1. **DuckDB tz-aware → naive shift bug:** `TIMESTAMP` is naive. Passing
+       a tz-aware datetime triggers a silent conversion to the host's
+       local time before storage (Estonia EEST = UTC+3 → +3h shift).
+       Solved by stripping tzinfo after explicit conversion.
+    2. **matchstat `Z`-but-not-UTC bug:** if `MATCHSTAT_SOURCE_TZ` is set
+       to something other than UTC, we reinterpret the incoming naive
+       wall-clock as being in that source TZ and convert to real UTC.
+       Use `MATCHSTAT_SOURCE_TZ=Europe/Moscow` to undo the +3 shift.
+    """
+    if dt is None:
+        return None
+    source_tz = _matchstat_source_tz()
+    # Strip the (misleading) tzinfo to get the raw wall-clock matchstat
+    # actually sent, then re-tag with the source TZ we believe it to be.
+    wall = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+    localised = wall.replace(tzinfo=source_tz)
+    return localised.astimezone(UTC).replace(tzinfo=None)
+
 
 PlayerResolver = Callable[[str, str], str | None]
 """(raw_player_name, tour) -> canonical_player_id or None.
@@ -129,13 +189,34 @@ def insert_scheduled_matches(
         )
         tournament_name = fx.tournament.name if fx.tournament else None
         tournament_country_acr = fx.tournament.country_acr if fx.tournament else None
+        # Phase 6.2: prefer the calendar's precise tier ("ATP 250" etc.)
+        # when available, but fall back to the fixture's `tournament.rank.name`
+        # ("Grand Slam", "Main tour"). matchstat's calendar endpoint is
+        # forward-only and silently drops currently-active tournaments
+        # (Phase 2 known issue), which leaves Roland Garros and other
+        # in-progress events with `tournament_tier=NULL` if we only
+        # consult the calendar. The fallback gives the Slam-prune logic
+        # the signal it needs without a per-tournament workaround.
         tournament_tier = tier_lookup.get(fx.tournament_id)
+        if tournament_tier is None and fx.tournament and fx.tournament.rank:
+            tournament_tier = fx.tournament.rank.name
         round_name = fx.round.name if fx.round else None
 
         p1_canonical = resolve_player(fx.player1.name, tour)
         p2_canonical = resolve_player(fx.player2.name, tour)
 
         rowcount_before = _scheduled_count(conn)
+        # ON CONFLICT DO UPDATE refreshes the mutable fields so a re-ingest
+        # corrects rows written before tz-normalization landed. We still
+        # count an UPDATE as "skipped" (row already existed) so the
+        # ingestion_runs row reflects new inserts only.
+        # Phase 6.2: matchstat returns the on-court time in `date` when
+        # confirmed; otherwise `date` is a `YYYY-MM-DDT12:00:00Z`
+        # day-level placeholder and the actual time is TBD. We persist
+        # both the time and a `time_confirmed` flag so the Home page
+        # can render "Tomorrow — time TBD" instead of a fake "11:00 CEST".
+        on_court_time = fixture_on_court_time(fx.date, fx.time_game)
+        time_confirmed = on_court_time is not None and not is_day_level_placeholder(on_court_time)
         conn.execute(
             """
             INSERT INTO scheduled_matches (
@@ -147,10 +228,36 @@ def insert_scheduled_matches(
                 player1_name, player2_name,
                 player1_country_acr, player2_country_acr,
                 player1_seed, player2_seed,
-                scheduled_start_utc, ingested_at
+                scheduled_start_utc, time_confirmed, ingested_at
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            ) ON CONFLICT (scheduled_match_id) DO NOTHING
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ) ON CONFLICT (scheduled_match_id) DO UPDATE SET
+                tournament_name        = excluded.tournament_name,
+                tournament_tier        = excluded.tournament_tier,
+                tournament_country_acr = excluded.tournament_country_acr,
+                surface                = excluded.surface,
+                round_external_id      = excluded.round_external_id,
+                round_name             = excluded.round_name,
+                -- Phase 6.2: matchstat re-uses fixture_external_id for
+                -- different matchups over time (observed live: Popyrin
+                -- -Svajda took over fx_id=1271 from Griekspoor-Arnaldi
+                -- at Roland Garros 2026). Without refreshing player
+                -- identity on conflict the row keeps the stale matchup
+                -- and the new matchup is silently lost. Treat the
+                -- latest payload as authoritative for every column.
+                player1_external_id    = excluded.player1_external_id,
+                player2_external_id    = excluded.player2_external_id,
+                player1_canonical_id   = excluded.player1_canonical_id,
+                player2_canonical_id   = excluded.player2_canonical_id,
+                player1_name           = excluded.player1_name,
+                player2_name           = excluded.player2_name,
+                player1_country_acr    = excluded.player1_country_acr,
+                player2_country_acr    = excluded.player2_country_acr,
+                player1_seed           = excluded.player1_seed,
+                player2_seed           = excluded.player2_seed,
+                scheduled_start_utc    = excluded.scheduled_start_utc,
+                time_confirmed         = excluded.time_confirmed,
+                ingested_at            = excluded.ingested_at
             """,
             [
                 scheduled_match_id,
@@ -174,8 +281,9 @@ def insert_scheduled_matches(
                 fx.player2.country_acr,
                 fx.seed1,
                 fx.seed2,
-                fx.date,
-                now,
+                _to_naive_utc(on_court_time),
+                time_confirmed,
+                _to_naive_utc(now),
             ],
         )
         if _scheduled_count(conn) > rowcount_before:

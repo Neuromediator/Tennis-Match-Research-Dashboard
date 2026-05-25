@@ -20,16 +20,19 @@ import pytest
 from tennis_predictor.data import schema
 from tennis_predictor.data.reconcile import seed_aliases_from_players
 from tennis_predictor.llm.tools.db_tools import (
+    _elo_logistic,
     get_head_to_head,
     get_player_ranking,
     get_player_stats,
     get_recent_form,
+    get_surface_elo,
 )
 from tennis_predictor.llm.tools.schemas import (
     GetHeadToHeadInput,
     GetPlayerRankingInput,
     GetPlayerStatsInput,
     GetRecentFormInput,
+    GetSurfaceEloInput,
     PlayerResolutionError,
 )
 
@@ -259,6 +262,44 @@ def test_get_recent_form_returns_newest_first_with_results(seeded_db) -> None:
     assert middle.result == "L"
     assert middle.opponent_name == "Jannik Sinner"
 
+    # 2025-07-14 is the newest, asked as-of 2026-01-01 → ~171 days stale.
+    assert out.latest_match_date == date(2025, 7, 14)
+    assert out.data_freshness_warning is not None
+    assert "2025-07-14" in out.data_freshness_warning
+
+
+def test_get_recent_form_no_freshness_warning_when_recent(seeded_db) -> None:
+    """Asked one day after the newest match — newest is 2025-07-14, asked
+    as-of 2025-07-15. Gap is 1 day, well within the 7-day Sackmann lag."""
+    out = get_recent_form(
+        seeded_db,
+        GetRecentFormInput(
+            player_name="Carlos Alcaraz",
+            tour="ATP",
+            as_of_date=date(2025, 7, 15),
+            n_matches=5,
+        ),
+    )
+    assert out.latest_match_date == date(2025, 7, 14)
+    assert out.data_freshness_warning is None
+
+
+def test_get_recent_form_empty_player_has_no_freshness_warning(seeded_db) -> None:
+    """Querying for matches strictly before the earliest stored one returns
+    zero matches → no freshness warning (no anchor to compare against)."""
+    out = get_recent_form(
+        seeded_db,
+        GetRecentFormInput(
+            player_name="Carlos Alcaraz",
+            tour="ATP",
+            as_of_date=date(2020, 1, 1),
+            n_matches=5,
+        ),
+    )
+    assert out.n_returned == 0
+    assert out.latest_match_date is None
+    assert out.data_freshness_warning is None
+
 
 def test_get_player_ranking_returns_most_recent_snapshot(seeded_db) -> None:
     out = get_player_ranking(
@@ -280,3 +321,75 @@ def test_get_player_ranking_returns_null_when_no_history(seeded_db) -> None:
     )
     assert out.rank is None
     assert out.snapshot_date is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.1: get_surface_elo
+# ---------------------------------------------------------------------------
+
+
+def _seed_surface_elo(conn: duckdb.DuckDBPyConnection) -> None:
+    # PLAYER_A_ID = Alcaraz, PLAYER_B_ID = Sinner per the fixture above.
+    conn.executemany(
+        "INSERT INTO elo_state (player_id, surface, rating, matches_played, last_updated_date) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (PLAYER_B_ID, "Clay", 2000.0, 50, date(2026, 5, 10)),  # Sinner
+            (PLAYER_A_ID, "Clay", 1800.0, 40, date(2026, 5, 9)),  # Alcaraz
+            (PLAYER_B_ID, "Hard", 1900.0, 60, date(2026, 4, 1)),  # Sinner
+            # Alcaraz has no Hard row — exercises the 1500 default below.
+        ],
+    )
+
+
+def test_get_surface_elo_returns_both_players_and_diff(seeded_db) -> None:
+    _seed_surface_elo(seeded_db)
+    out = get_surface_elo(
+        seeded_db,
+        GetSurfaceEloInput(
+            player_a_name="Jannik Sinner",
+            player_b_name="Carlos Alcaraz",
+            tour="ATP",
+            surface="Clay",
+            as_of_date=date(2026, 5, 24),
+        ),
+    )
+    assert out.player_a_elo == 2000.0
+    assert out.player_b_elo == 1800.0
+    assert out.diff_a_minus_b == 200.0
+    # Logistic of +200 ≈ 0.76
+    assert abs(out.baseline_prob_a - _elo_logistic(200.0)) < 1e-9
+    assert out.elo_state_snapshot_date == date(2026, 5, 10)
+
+
+def test_get_surface_elo_uses_1500_default_when_no_row(seeded_db) -> None:
+    """Player without an `elo_state` row on the queried surface gets the
+    same 1500 prior `EloState` uses for first appearance."""
+    _seed_surface_elo(seeded_db)
+    out = get_surface_elo(
+        seeded_db,
+        GetSurfaceEloInput(
+            player_a_name="Jannik Sinner",
+            player_b_name="Carlos Alcaraz",
+            tour="ATP",
+            surface="Hard",
+            as_of_date=date(2026, 5, 24),
+        ),
+    )
+    assert out.player_a_elo == 1900.0  # Sinner has Hard row
+    assert out.player_b_elo == 1500.0  # Alcaraz missing — default
+    assert out.diff_a_minus_b == 400.0
+
+
+def test_get_surface_elo_refuses_self_match(seeded_db) -> None:
+    with pytest.raises(PlayerResolutionError, match="self-match"):
+        get_surface_elo(
+            seeded_db,
+            GetSurfaceEloInput(
+                player_a_name="Jannik Sinner",
+                player_b_name="Jannik Sinner",
+                tour="ATP",
+                surface="Clay",
+                as_of_date=date(2026, 5, 24),
+            ),
+        )

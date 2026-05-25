@@ -75,9 +75,20 @@ async def search_web(payload: WebSearchInput) -> WebSearchOutput:
             "Sign up at app.tavily.com (free tier, 1000 req/month, no card)."
         )
 
+    # Phase 6.2 (May 2026) tightening:
+    # - `topic="news"`: Tavily news index biases results to dated news
+    #   articles instead of general web pages. Without this we were
+    #   getting stale tournament recaps with no `published_date` (e.g.,
+    #   January 2026 Australian Open injury for a player in his May 26
+    #   Roland Garros R1).
+    # - `days=32`: Tavily-side recency filter, matches our agent's
+    #   32-day window. Pre-filters at the source so the agent doesn't
+    #   even see months-old items.
     body = {
         "query": payload.query,
         "search_depth": "basic",
+        "topic": "news",
+        "days": 32,
         "max_results": payload.max_results,
         "exclude_domains": list(BLOCKED_DOMAINS),
         "include_answer": False,

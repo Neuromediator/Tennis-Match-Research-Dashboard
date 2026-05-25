@@ -194,7 +194,11 @@ def test_refund_web_search_returns_slot() -> None:
 
 
 def test_consume_pending_returns_and_resets() -> None:
-    tracker = BudgetTracker(AgentBudget())
+    # Phase 6.1 dropped fetch_url from the agent's tool surface; the
+    # default `max_fetch_urls = 0`. Use an explicit non-zero budget here
+    # so the BudgetTracker fetch-url machinery is still exercised by the
+    # test (the tracker keeps the counters in shape for forward compat).
+    tracker = BudgetTracker(AgentBudget(max_fetch_urls=2))
     tracker.reserve_web_search()
     tracker.register_tool_search(cost_usd=0.005)
     tracker.reserve_fetch_url()

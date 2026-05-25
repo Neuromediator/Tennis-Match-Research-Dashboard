@@ -76,8 +76,12 @@ def main() -> int:
     parser.add_argument(
         "--fixture-lookahead-days",
         type=int,
-        default=1,
-        help="How many days past 'today' to pull fixtures for (default 1 — today + tomorrow).",
+        default=3,
+        help=(
+            "How many days past 'today' to pull fixtures for (default 3 — "
+            "covers a Grand Slam 2-day inter-round gap so R2 fixtures show "
+            "up on the Home page from Monday onward)."
+        ),
     )
     args = parser.parse_args()
 

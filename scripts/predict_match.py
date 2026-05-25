@@ -31,11 +31,16 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import date, datetime
+from datetime import date
 from typing import Literal, cast, get_args
 
 import duckdb
 
+from tennis_predictor.app.context import (
+    ContextBuildError,
+    load_context_from_freeform,
+    load_context_from_match_id,
+)
 from tennis_predictor.config import DUCKDB_PATH
 from tennis_predictor.data.schema import create_all_tables
 from tennis_predictor.features.schema import Surface, TournamentLevel
@@ -53,40 +58,6 @@ from tennis_predictor.llm.tools.schemas import (
 from tennis_predictor.llm.tools.submit import AgentResponse
 
 logger = logging.getLogger("predict_match")
-
-
-# matchstat's tier strings → our canonical `TournamentLevel`. Mirrors the
-# whitelist in `data/matchstat.py` and the canonical levels in
-# `features/schema.py`. Anything not in this dict aborts with a clean
-# error: we will not silently coerce a Challenger row into "ATP250".
-_MATCHSTAT_TIER_TO_LEVEL: dict[str, TournamentLevel] = {
-    "Grand Slam": "Slam",
-    "ATP Masters 1000": "M1000",
-    "ATP 500": "ATP500",
-    "ATP 250": "ATP250",
-    "WTA Masters 1000": "M1000",
-    "WTA 1000": "M1000",
-    "WTA 500": "WTA500",
-    "WTA 250": "WTA250",
-    "Finals": "Finals",
-}
-
-# Best-of inferred from the tournament level when running in --match-id
-# mode: ATP Slams are best-of-5 and so are no other current tour-level
-# events on the men's side; WTA is best-of-3 everywhere. Free-form mode
-# accepts an explicit --best-of.
-_LEVEL_BEST_OF_DEFAULT: dict[tuple[str, TournamentLevel], int] = {
-    ("ATP", "Slam"): 5,
-    ("ATP", "M1000"): 3,
-    ("ATP", "ATP500"): 3,
-    ("ATP", "ATP250"): 3,
-    ("ATP", "Finals"): 3,
-    ("WTA", "Slam"): 3,
-    ("WTA", "M1000"): 3,
-    ("WTA", "WTA500"): 3,
-    ("WTA", "WTA250"): 3,
-    ("WTA", "Finals"): 3,
-}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -146,66 +117,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _load_context_from_match_id(
-    conn: duckdb.DuckDBPyConnection, scheduled_match_id: str
-) -> MatchContext:
-    """Look up `scheduled_matches` by scheduled_match_id and map its
-    fields onto a `MatchContext`."""
-    row = conn.execute(
-        """
-        SELECT tour, player1_name, player2_name, surface, tournament_tier,
-               tournament_name, scheduled_start_utc
-        FROM scheduled_matches
-        WHERE scheduled_match_id = ?
-        """,
-        [scheduled_match_id],
-    ).fetchone()
-    if row is None:
-        raise SystemExit(f"no scheduled match found with id={scheduled_match_id!r}")
-    (
-        tour,
-        player1_name,
-        player2_name,
-        surface,
-        tier,
-        tournament_name,
-        scheduled_start_utc,
-    ) = row
-
-    if tour not in ("ATP", "WTA"):
-        raise SystemExit(f"unsupported tour {tour!r} in scheduled_matches row")
-    if surface not in get_args(Surface):
-        raise SystemExit(
-            f"surface {surface!r} not in supported set {get_args(Surface)}; "
-            "row may pre-date Phase-2 surface normalisation."
-        )
-    level = _MATCHSTAT_TIER_TO_LEVEL.get(tier or "")
-    if level is None:
-        raise SystemExit(
-            f"tournament_tier {tier!r} does not map to a model tournament_level. "
-            "Out-of-scope events (Challengers, ITF) cannot be predicted."
-        )
-
-    best_of = cast(Literal[3, 5], _LEVEL_BEST_OF_DEFAULT[(tour, level)])
-    match_date = (
-        scheduled_start_utc.date()
-        if isinstance(scheduled_start_utc, datetime)
-        else (scheduled_start_utc or date.today())
-    )
-    return MatchContext(
-        tour=tour,
-        player_a_name=player1_name,
-        player_b_name=player2_name,
-        surface=surface,
-        tournament_level=level,
-        tournament_name=tournament_name,
-        best_of=best_of,
-        match_date=match_date,
-        scheduled_match_id=scheduled_match_id,
-    )
-
-
-def _load_context_from_freeform(args: argparse.Namespace) -> MatchContext:
+def _build_freeform_context(args: argparse.Namespace) -> MatchContext:
+    """Validate the CLI free-form flags and call the shared builder."""
     missing = [
         flag
         for flag, val in (
@@ -225,24 +138,20 @@ def _load_context_from_freeform(args: argparse.Namespace) -> MatchContext:
     except ValueError as exc:
         raise SystemExit(f"invalid --date {args.date!r}: {exc}") from exc
 
-    best_of_raw = args.best_of or _LEVEL_BEST_OF_DEFAULT.get((args.tour, args.tournament_level))
-    if best_of_raw is None:
-        raise SystemExit(
-            "could not infer --best-of for "
-            f"({args.tour}, {args.tournament_level}); please pass it explicitly"
+    best_of_arg = cast(Literal[3, 5] | None, args.best_of)
+    try:
+        return load_context_from_freeform(
+            tour=args.tour,
+            player_a_name=args.player_a,
+            player_b_name=args.player_b,
+            surface=args.surface,
+            tournament_level=args.tournament_level,
+            match_date=match_date,
+            best_of=best_of_arg,
+            tournament_name=args.tournament,
         )
-    best_of = cast(Literal[3, 5], best_of_raw)
-    return MatchContext(
-        tour=args.tour,
-        player_a_name=args.player_a,
-        player_b_name=args.player_b,
-        surface=args.surface,
-        tournament_level=args.tournament_level,
-        tournament_name=args.tournament,
-        best_of=best_of,
-        match_date=match_date,
-        scheduled_match_id=None,
-    )
+    except ContextBuildError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _print_human_readable(ctx: MatchContext, resp: AgentResponse) -> None:
@@ -260,19 +169,21 @@ def _print_human_readable(ctx: MatchContext, resp: AgentResponse) -> None:
     print(f"  P({ctx.player_a_name} wins) = {resp.model_probability_player_a:.3f}")
     print(f"  P({ctx.player_b_name} wins) = {resp.model_probability_player_b:.3f}")
     print()
-    print(f"Confidence band: {resp.confidence_band}")
+    print(f"News lookup status: {resp.news_lookup_status}")
     print()
-    print("Key factors:")
-    for factor in resp.key_factors:
-        print(f"  - {factor}")
-    print()
-    print("Narrative:")
-    print("  " + resp.narrative.replace("\n", "\n  "))
-    if resp.caveats:
-        print()
-        print("Caveats:")
-        for caveat in resp.caveats:
-            print(f"  - {caveat}")
+    if resp.news_items:
+        print(f"News items ({len(resp.news_items)}):")
+        for item in resp.news_items:
+            date_part = item.published_date or "date unknown"
+            print(f"  - [{item.source_domain}, {date_part}] ({item.category}) {item.title}")
+            print(f"      {item.url}")
+            if item.snippet:
+                print(f"      {item.snippet}")
+    else:
+        if resp.news_lookup_status == "no_results":
+            print("No notable news in the last 32 days for either player.")
+        elif resp.news_lookup_status == "failed":
+            print("News lookup unavailable.")
     if resp.tools_used:
         print()
         print("Tools used: " + ", ".join(resp.tools_used))
@@ -332,9 +243,12 @@ def main(argv: list[str] | None = None) -> int:
     create_all_tables(conn)
 
     if args.match_id:
-        ctx = _load_context_from_match_id(conn, args.match_id)
+        try:
+            ctx = load_context_from_match_id(conn, args.match_id)
+        except ContextBuildError as exc:
+            raise SystemExit(str(exc)) from exc
     else:
-        ctx = _load_context_from_freeform(args)
+        ctx = _build_freeform_context(args)
 
     since_trace_id = _current_trace_id(conn)
     try:

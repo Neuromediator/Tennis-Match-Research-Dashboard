@@ -33,14 +33,26 @@ from tennis_predictor.llm.tools.submit import (
 # ---------------------------------------------------------------------------
 
 
+def _sample_news_item(**overrides) -> dict:
+    base = {
+        "title": "Player A withdraws from Madrid SF — ankle",
+        "url": "https://bbc.co.uk/sport/tennis/12345",
+        "snippet": "Player A withdrew this morning from his Madrid Open semifinal...",
+        "published_date": "2026-05-15",
+        "source_domain": "bbc.co.uk",
+        "player_subject": "player_a",
+        "category": "injury",
+    }
+    base.update(overrides)
+    return base
+
+
 def test_agent_response_valid_payload_round_trips() -> None:
     resp = AgentResponse(
         model_probability_player_a=0.62,
         model_probability_player_b=0.38,
-        key_factors=["surface edge", "fresh from a long rest"],
-        narrative="Player A has a clear surface-Elo lead and won their last meeting.",
-        confidence_band="medium",
-        caveats=["no recent news surfaced"],
+        news_items=[_sample_news_item()],  # type: ignore[list-item]
+        news_lookup_status="ok",
         tools_used=["get_model_prediction", "get_head_to_head", "web_search"],
     )
     parsed = AgentResponse.model_validate_json(resp.model_dump_json())
@@ -55,47 +67,49 @@ def test_agent_response_valid_payload_round_trips() -> None:
         "adjusted_probability",
         "model_probability_override",
         "model_prob_player_a",
+        "narrative",
+        "confidence_band",
+        "caveats",
+        "key_factors",
+        "summary",
     ],
 )
-def test_agent_response_rejects_probability_like_extra_fields(forbidden_field: str) -> None:
+def test_agent_response_rejects_forbidden_extra_fields(forbidden_field: str) -> None:
+    """Phase 6.1: rejects probability-like fields (hard rule #4) AND
+    prose-like synthesis fields (the structural reason 6.1 exists)."""
     payload = {
         "model_probability_player_a": 0.5,
         "model_probability_player_b": 0.5,
-        "key_factors": ["a"],
-        "narrative": "n",
-        "confidence_band": "low",
-        "caveats": [],
+        "news_items": [],
+        "news_lookup_status": "no_results",
         "tools_used": [],
-        forbidden_field: 0.7,
+        forbidden_field: 0.7 if "probability" in forbidden_field else "x",
     }
     with pytest.raises(ValidationError):
         AgentResponse.model_validate(payload)
 
 
-def test_agent_response_confidence_band_constrained_to_three_values() -> None:
+def test_agent_response_news_lookup_status_constrained_to_three_values() -> None:
     with pytest.raises(ValidationError):
         AgentResponse(
             model_probability_player_a=0.5,
             model_probability_player_b=0.5,
-            key_factors=["a"],
-            narrative="n",
-            confidence_band="very high",  # type: ignore[arg-type]
-            caveats=[],
+            news_items=[],
+            news_lookup_status="great",  # type: ignore[arg-type]
             tools_used=[],
         )
 
 
-def test_agent_response_requires_at_least_one_key_factor() -> None:
-    with pytest.raises(ValidationError):
-        AgentResponse(
-            model_probability_player_a=0.5,
-            model_probability_player_b=0.5,
-            key_factors=[],
-            narrative="n",
-            confidence_band="low",
-            caveats=[],
-            tools_used=[],
-        )
+def test_agent_response_allows_empty_news_list_with_no_results_status() -> None:
+    """The most common UX outcome: nothing material was found."""
+    resp = AgentResponse(
+        model_probability_player_a=0.5,
+        model_probability_player_b=0.5,
+        news_items=[],
+        news_lookup_status="no_results",
+        tools_used=["web_search"],
+    )
+    assert resp.news_items == []
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +137,34 @@ def test_submit_analysis_schema_does_not_declare_probability_fields() -> None:
         )
 
 
-def test_submit_analysis_confidence_band_enumerates_three_values() -> None:
-    enum_values = SUBMIT_ANALYSIS_INPUT_SCHEMA["properties"]["confidence_band"]["enum"]
-    assert sorted(enum_values) == ["high", "low", "medium"]
+def test_submit_analysis_does_not_declare_prose_fields() -> None:
+    """Phase 6.1 contract: the LLM no longer writes prose. Any
+    `narrative`, `confidence_band`, `caveats`, `key_factors` field
+    showing up in the schema would silently re-enable the failure mode
+    Phase 6.1 was created to eliminate."""
+    properties = SUBMIT_ANALYSIS_INPUT_SCHEMA["properties"]
+    for forbidden in ("narrative", "confidence_band", "caveats", "key_factors", "summary"):
+        assert forbidden not in properties, (
+            f"submit_analysis must not declare a prose field (found: {forbidden!r}). "
+            "Phase 6.1 retired these — see docs/tutorials/phase_6_1_notes.md."
+        )
+
+
+def test_submit_analysis_news_lookup_status_enumerates_three_values() -> None:
+    enum_values = SUBMIT_ANALYSIS_INPUT_SCHEMA["properties"]["news_lookup_status"]["enum"]
+    assert sorted(enum_values) == ["failed", "no_results", "ok"]
+
+
+def test_submit_analysis_news_item_category_whitelist_enumerated() -> None:
+    """The whitelist on `category` is enforced at JSON-schema level so
+    Anthropic rejects unknown values before our code even sees them."""
+    item_schema = SUBMIT_ANALYSIS_INPUT_SCHEMA["properties"]["news_items"]["items"]
+    cat_enum = item_schema["properties"]["category"]["enum"]
+    assert "injury" in cat_enum
+    assert "withdrawal" in cat_enum
+    assert "result" in cat_enum
+    assert "interview" not in cat_enum, "interview is intentionally excluded"
+    assert "sponsorship" not in cat_enum
 
 
 # ---------------------------------------------------------------------------

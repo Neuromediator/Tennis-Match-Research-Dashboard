@@ -211,9 +211,129 @@ CREATE TABLE IF NOT EXISTS scheduled_matches (
     player2_seed              VARCHAR,
 
     scheduled_start_utc       TIMESTAMP,
+    -- Phase 6.2: TRUE when matchstat returned a confirmed on-court
+    -- time. FALSE when only a day-level placeholder
+    -- (`YYYY-MM-DDT12:00:00Z`) was returned and the actual time is
+    -- still TBD. The Home page renders unconfirmed times as "time TBD".
+    time_confirmed            BOOLEAN NOT NULL DEFAULT TRUE,
     ingested_at               TIMESTAMP NOT NULL,
 
     UNIQUE (source, fixture_external_id)
+);
+"""
+
+# Phase 6.1: per-player recent-matches cache. One row per (tour, player_id)
+# carrying the most recent matchstat `player/past-matches/{id}` payload and
+# the time it was fetched. The Prediction page's "8 last matches" panel
+# reads this; entries older than 24h are refetched via the live API.
+# The `payload` column holds the raw matchstat response — kept as JSON so
+# any future field addition on matchstat's side doesn't require a schema
+# migration here.
+MATCHSTAT_PLAYER_RECENT_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS matchstat_player_recent_cache (
+    tour         VARCHAR NOT NULL,
+    player_id    INTEGER NOT NULL,
+    fetched_at   TIMESTAMP NOT NULL,
+    payload      JSON NOT NULL,
+    PRIMARY KEY (tour, player_id)
+);
+"""
+
+# Phase 6.1: H2H cache. `p1_id < p2_id` is a column-level invariant
+# enforced at the helper layer (callers must canonicalise before writing),
+# which lets `(tour, p1_id, p2_id)` serve as the cache key regardless of
+# which orientation the agent asks about.
+MATCHSTAT_H2H_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS matchstat_h2h_cache (
+    tour         VARCHAR NOT NULL,
+    p1_id        INTEGER NOT NULL,
+    p2_id        INTEGER NOT NULL,
+    fetched_at   TIMESTAMP NOT NULL,
+    payload      JSON NOT NULL,
+    PRIMARY KEY (tour, p1_id, p2_id),
+    CHECK (p1_id < p2_id)
+);
+"""
+
+# Phase 6.1: month-bucketed quota counter against matchstat's 500/month
+# free-tier cap. `month` is "YYYY-MM" (UTC). `requests_used` is the
+# month-to-date count of fresh API calls (cache hits do NOT increment).
+# `cap` is stored per row so a future plan change just needs an UPDATE,
+# not a schema change. `MatchstatLiveFetcher` raises BudgetExceeded when
+# `requests_used >= cap - 20` to leave headroom for the daily hot refresh.
+MATCHSTAT_QUOTA_DDL = """
+CREATE TABLE IF NOT EXISTS matchstat_quota (
+    month            VARCHAR PRIMARY KEY,
+    requests_used    INTEGER NOT NULL DEFAULT 0,
+    cap              INTEGER NOT NULL DEFAULT 500
+);
+"""
+
+# Phase 6.2: pre-match h2h odds for upcoming fixtures, fetched from
+# The Odds API. UI-only — never a training feature (CLAUDE.md hard
+# rule #3). One row per (tour, normalised pair, UTC date); upserted
+# on every refresh. Aggregated `median_*` columns are the headline
+# displayed on the Prediction page; `pinnacle_*` columns carry the
+# sharp-line subtitle when Pinnacle is in The Odds API bookmaker list.
+# `source` is `the_odds_api` by default, `tavily` for the regex-extract
+# fallback (display-only with reduced confidence).
+PRE_MATCH_ODDS_DDL = """
+CREATE TABLE IF NOT EXISTS pre_match_odds (
+    fixture_match_key        VARCHAR PRIMARY KEY,
+    tour                     VARCHAR NOT NULL,
+    sport_key                VARCHAR,
+    event_id                 VARCHAR,
+    player_a_name            VARCHAR NOT NULL,
+    player_b_name            VARCHAR NOT NULL,
+    commence_time_utc        TIMESTAMP NOT NULL,
+    median_odds_a            DOUBLE,
+    median_odds_b            DOUBLE,
+    best_odds_a              DOUBLE,
+    best_odds_b              DOUBLE,
+    median_implied_prob_a    DOUBLE,
+    median_implied_prob_b    DOUBLE,
+    books_count              INTEGER,
+    pinnacle_odds_a          DOUBLE,
+    pinnacle_odds_b          DOUBLE,
+    pinnacle_implied_prob_a  DOUBLE,
+    pinnacle_implied_prob_b  DOUBLE,
+    fetched_at               TIMESTAMP NOT NULL,
+    source                   VARCHAR NOT NULL DEFAULT 'the_odds_api'
+);
+"""
+
+# Phase 6.2: month-bucketed quota counter for The Odds API. Free tier
+# is 500 credits/month (1 credit per `regions=eu` odds call). Mirrors
+# the matchstat_quota layout so the Dashboard widget can read both
+# with the same query shape.
+ODDS_API_QUOTA_DDL = """
+CREATE TABLE IF NOT EXISTS odds_api_quota (
+    month            VARCHAR PRIMARY KEY,
+    requests_used    INTEGER NOT NULL DEFAULT 0,
+    cap              INTEGER NOT NULL DEFAULT 500
+);
+"""
+
+# Phase 6.2: append-only log of model predictions emitted by the agent.
+# Backs the Dashboard "recent predictions vs market" scoreboard so the
+# track record is visible at a glance instead of buried behind average
+# Brier metrics. Joined to `pre_match_odds` by (tour, normalised
+# player names, UTC date) — same key derivation as the odds upserter.
+# CLAUDE.md hard rule #3 still holds: this is display-only, never an
+# input to model training.
+PREDICTION_LOG_SEQUENCE_DDL = "CREATE SEQUENCE IF NOT EXISTS seq_prediction_log START 1;"
+
+PREDICTION_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS prediction_log (
+    log_id                       BIGINT PRIMARY KEY DEFAULT nextval('seq_prediction_log'),
+    ts                           TIMESTAMP NOT NULL,
+    scheduled_match_id           VARCHAR,
+    tour                         VARCHAR NOT NULL,
+    player_a_name                VARCHAR NOT NULL,
+    player_b_name                VARCHAR NOT NULL,
+    surface                      VARCHAR,
+    match_date                   DATE,
+    model_probability_player_a   DOUBLE NOT NULL
 );
 """
 
@@ -351,6 +471,13 @@ TABLE_DDL: list[str] = [
     TRAINING_FEATURES_DDL,
     SCHEDULED_MATCHES_DDL,
     INGESTION_RUNS_DDL,
+    MATCHSTAT_PLAYER_RECENT_CACHE_DDL,
+    MATCHSTAT_H2H_CACHE_DDL,
+    MATCHSTAT_QUOTA_DDL,
+    PRE_MATCH_ODDS_DDL,
+    ODDS_API_QUOTA_DDL,
+    PREDICTION_LOG_SEQUENCE_DDL,
+    PREDICTION_LOG_DDL,
 ]
 
 EXPECTED_TABLES: frozenset[str] = frozenset(
@@ -366,6 +493,12 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "training_features",
         "scheduled_matches",
         "ingestion_runs",
+        "matchstat_player_recent_cache",
+        "matchstat_h2h_cache",
+        "matchstat_quota",
+        "pre_match_odds",
+        "odds_api_quota",
+        "prediction_log",
     }
 )
 
@@ -442,6 +575,39 @@ _LLM_TRACES_PHASE5_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _migrate_scheduled_matches(conn: duckdb.DuckDBPyConnection) -> None:
+    """Phase 6.2 migration: add `time_confirmed BOOLEAN` to a
+    pre-existing `scheduled_matches` table when it's missing. Existing
+    rows default TRUE (we don't know whether their stored time was
+    day-level-placeholder or not — assume confirmed; the next refresh
+    upserts with the correct value).
+    """
+    table_exists = (
+        conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'scheduled_matches'"
+        ).fetchone()
+        is not None
+    )
+    if not table_exists:
+        return
+    existing_cols = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'scheduled_matches'"
+        ).fetchall()
+    }
+    if "time_confirmed" not in existing_cols:
+        # DuckDB doesn't accept `ADD COLUMN ... NOT NULL DEFAULT ...` in
+        # a single statement (Parser limitation). Workaround: add nullable
+        # then backfill. The Home view tolerates a NULL value as "trust
+        # the stored time" (matches the pre-migration behaviour).
+        conn.execute("ALTER TABLE scheduled_matches ADD COLUMN time_confirmed BOOLEAN")
+        conn.execute(
+            "UPDATE scheduled_matches SET time_confirmed = TRUE WHERE time_confirmed IS NULL"
+        )
+
+
 def _migrate_llm_traces(conn: duckdb.DuckDBPyConnection) -> None:
     """Idempotent migration of `llm_traces` to the Phase 5 shape.
 
@@ -475,6 +641,7 @@ def create_all_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """Create every table and index. Idempotent."""
     _migrate_training_features(conn)
     _migrate_llm_traces(conn)
+    _migrate_scheduled_matches(conn)
     for ddl in TABLE_DDL:
         conn.execute(ddl)
     for idx in INDEXES:

@@ -4,17 +4,27 @@ A single-process Python application with five logical layers. No microservices. 
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ Interface layer (Streamlit)                                        │
-│   - Prediction page (LLM-mediated)                                 │
-│   - Evaluation dashboard (calibration plots, llm_traces browser)   │
+│ Interface layer (Streamlit) — Phase 6.2: research dashboard        │
+│   - Home (upcoming matches)                                        │
+│   - Match dashboard: comparison row (market / model / surface-Elo) │
+│     + "why model differs" panel when gap > 10pp + H2H detail +     │
+│     two-column recent form + LLM-discovered news                   │
+│   - Custom match (3-input form with player autocomplete)           │
+│   - Model evaluation (calibration plots, llm_traces, costs,        │
+│     last-20 model-vs-market gaps scoreboard)                       │
 └────────────────────┬───────────────────────────────────────────────┘
                      │
 ┌────────────────────▼───────────────────────────────────────────────┐
-│ LLM agent layer                                                    │
+│ LLM agent layer (Phase 6.1 scope)                                  │
 │   - LLMClient (Anthropic) with prompt caching + llm_traces logging │
-│   - Tools: get_player_stats / get_head_to_head / get_recent_form / │
-│     get_model_prediction / search_tennis_news / get_player_ranking │
-│   - Structured output: AgentResponse (no LLM-emitted probability)  │
+│   - LLM tools: get_model_prediction (mandatory) /                  │
+│     get_head_to_head (detailed) / get_surface_elo / web_search /   │
+│     submit_analysis                                                │
+│   - View-layer helpers (NOT LLM tools): fetch_recent_n_matches,    │
+│     fetch_pre_match_odds (Phase 6.2)                               │
+│   - Structured output: AgentResponse = news_items + status only.   │
+│     No narrative, no caveats, no confidence_band — every shown     │
+│     fact carries source+date as adjacent UI metadata.              │
 └──────────┬─────────────────────────────────┬───────────────────────┘
            │                                 │
 ┌──────────▼──────────────┐    ┌─────────────▼──────────────────────┐
@@ -31,15 +41,18 @@ A single-process Python application with five logical layers. No microservices. 
 │ Data layer (DuckDB, single file)                                  │
 │   matches, scheduled_matches, players, rankings, player_aliases,  │
 │   market_implied_probabilities, elo_state, last_match_state,      │
-│   training_features, llm_traces, ingestion_runs                   │
+│   training_features, llm_traces, ingestion_runs,                  │
+│   matchstat_player_recent_cache, matchstat_h2h_cache,             │
+│   matchstat_quota, pre_match_odds (Phase 6.2)                     │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Data sources
 
 - **Cold:** Jeff Sackmann's `tennis_atp` and `tennis_wta` repos as git submodules. Used for both prediction targets (tour-level singles) and feature computation (Challengers/Futures contribute to ratings but not to training labels).
-- **Hot:** matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI), free tier 500 req/month. Two responsibilities: (a) currently-known upcoming fixtures into `scheduled_matches` — in tennis this is whatever the draw has surfaced so far (full R1 right after a draw, then today/tomorrow's matches as the bracket resolves), this is what the product lets users predict against, (b) inter-week ranking overlay between weekly Sackmann snapshots. Completed matches do NOT come from matchstat — its `calendar/{year}` is forward-only and silently drops currently-active tournaments, making the calendar-driven results path unreliable. Sackmann (cold) is the source of truth for finished matches; the trade-off is a 1–7 day lag for newly-finished events. Daily refresh logs to `ingestion_runs` so the UI can surface freshness and so we stay inside the monthly quota.
-- **Benchmark:** tennis-data.co.uk archives provide closing-price implied probabilities. Loaded into `market_implied_probabilities`. **Not a feature.**
+- **Hot:** matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI), free tier 500 req/month. Three responsibilities: (a) currently-known upcoming fixtures into `scheduled_matches` — in tennis this is whatever the draw has surfaced so far (full R1 right after a draw, then today/tomorrow's matches as the bracket resolves), this is what the product lets users predict against, (b) inter-week ranking overlay between weekly Sackmann snapshots, (c) **Phase 6.1: on-demand per-player past-matches + H2H** via `/atp/player/past-matches/{id}` and `/atp/h2h/matches/{a}/{b}` (the correct H2H endpoint per `tennisapidoc.matchstat.com/h2h` — Phase 6.1 wrongly used `/atp/fixtures/h2h/{a}/{b}` which returns upcoming fixtures, fix scheduled in Phase 6.2 Step 4.1), used to show the user fresh "last 8 matches" + detailed H2H on the Prediction page. Cached 24h in `matchstat_player_recent_cache` / `matchstat_h2h_cache`; quota tracked in `matchstat_quota` with a 480/500 graceful-fallback threshold. Completed matches in bulk (full-tournament `tournament/results`) still do NOT come from matchstat — its `calendar/{year}` is forward-only and silently drops currently-active tournaments. Sackmann (cold) remains the source of truth for the training matches table; the on-demand path only enriches the per-prediction view layer. Daily refresh logs to `ingestion_runs`.
+- **Live market odds (Phase 6.2):** The Odds API (`the-odds-api.com`), free tier 500 credits/month. Per-tournament tennis sport keys (`tennis_atp_french_open`, `tennis_wta_madrid`, etc.) discovered daily via `GET /v4/sports/?all=false`, then odds fetched per active key with `regions=eu&markets=h2h&oddsFormat=decimal`. Persisted to `pre_match_odds` table with both median-across-books and Pinnacle-specific columns. Daily batch via `scripts/refresh_pre_match_odds.py` (~120-180 credits/month) plus lazy 24h refresh on Prediction-page load (~30 credits/month). Not used as a training feature (hard rule #3); rendered in the dashboard's comparison row alongside the model's probability.
+- **Historical benchmark:** tennis-data.co.uk archives provide closing-price implied probabilities. Loaded into `market_implied_probabilities`. **Not a feature.** Used for Phase 4 calibration reports (model Brier vs market Brier on historical walk-forward folds).
 
 ## Cross-cutting concerns
 

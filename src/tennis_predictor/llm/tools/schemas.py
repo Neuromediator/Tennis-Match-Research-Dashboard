@@ -41,7 +41,7 @@ contract.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -49,6 +49,30 @@ from pydantic import BaseModel, ConfigDict, Field
 from tennis_predictor.features.schema import Surface, TournamentLevel
 
 Tour = Literal["ATP", "WTA"]
+
+# Phase 6.1 — completion-status sentinel for per-match rows. Mirrors
+# `matchstat.parse_completion_status` so the view layer can render a
+# small badge (RET / W/O / DEF) next to the score.
+MatchCompletionStatus = Literal["W", "RET", "WO", "DEF"]
+
+# Phase 6.1 — news category whitelist for the bounded LLM job. `other`
+# is a fallback the agent may emit when it can't fit an item; the agent
+# loop drops `other`-tagged items before returning to the caller.
+NewsCategory = Literal[
+    "injury",
+    "withdrawal",
+    "illness",
+    "result",
+    "coach_change",
+    "personal",
+    "other",
+]
+
+# Phase 6.1 — which player(s) a news item refers to.
+NewsPlayerSubject = Literal["player_a", "player_b", "both"]
+
+# Phase 6.1 — how the LLM agent classifies its news lookup outcome.
+NewsLookupStatus = Literal["ok", "no_results", "failed"]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +153,20 @@ class GetModelPredictionInput(BaseModel):
     match_date: date
 
 
+class GetSurfaceEloInput(BaseModel):
+    """Phase 6.1: LLM-callable tool returning both players' surface Elo
+    in a single round-trip (saves one tool iteration vs. issuing two
+    separate `get_player_stats`-style calls)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    player_a_name: str = Field(min_length=1)
+    player_b_name: str = Field(min_length=1)
+    tour: Tour
+    surface: Surface
+    as_of_date: date
+
+
 # ---------------------------------------------------------------------------
 # Tool outputs — the structured payload the tool returns to the LLM.
 # ---------------------------------------------------------------------------
@@ -189,6 +227,141 @@ class HeadToHeadResult(BaseModel):
     matches: list[HeadToHeadMatch] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Phase 6.1: detailed H2H + Surface Elo for the new bounded agent.
+# ---------------------------------------------------------------------------
+
+
+class H2HMatchDetail(BaseModel):
+    """One row in `H2HSummary.matches`. Extends the legacy `HeadToHeadMatch`
+    with pre-match odds and a parsed completion-status sentinel so the
+    Prediction page can render `RET` / `W/O` / `DEF` badges and surface
+    upset-by-odds context."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    match_date: date
+    tournament_name: str | None = None
+    round_name: str | None = None
+    surface: str | None = None
+    winner_player_id: str | None = None
+    winner_name: str | None = None
+    score: str | None = None
+    odds_winner: float | None = Field(default=None, ge=1.0)
+    odds_loser: float | None = Field(default=None, ge=1.0)
+    completion_status: MatchCompletionStatus = "W"
+
+
+class H2HSummary(BaseModel):
+    """Phase 6.1 replacement for `HeadToHeadResult`. Carries the same
+    aggregate counts plus a per-surface breakdown and an explicit
+    `data_source` tag so the UI can show a "matchstat quota exhausted —
+    using Sackmann" banner when the cold-layer fallback fires."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    player_a_name: str
+    player_b_name: str
+    player_a_id: str
+    player_b_id: str
+    tour: Tour
+    player_a_wins: int = Field(ge=0)
+    player_b_wins: int = Field(ge=0)
+    # Per-surface (a_wins, b_wins) tuples. Keys are canonical Surface
+    # literals; only surfaces with at least one meeting appear.
+    by_surface: dict[str, tuple[int, int]] = Field(default_factory=dict)
+    matches: list[H2HMatchDetail] = Field(default_factory=list)
+    data_source: Literal["matchstat", "sackmann"]
+    fetched_at: datetime
+
+
+class SurfaceEloSummary(BaseModel):
+    """Output of `get_surface_elo`. `baseline_prob_a` is the logistic
+    transform of the rating diff (1 / (1 + 10**(-diff/400))) — the same
+    formula `EloState.expected_score` uses internally so the agent and
+    the trained model are looking at the same baseline."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    player_a_name: str
+    player_b_name: str
+    player_a_id: str
+    player_b_id: str
+    tour: Tour
+    surface: Surface
+    as_of_date: date
+    player_a_elo: float
+    player_b_elo: float
+    diff_a_minus_b: float
+    baseline_prob_a: float = Field(ge=0.0, le=1.0)
+    elo_state_snapshot_date: date | None = None
+
+
+class RecentMatchDetail(BaseModel):
+    """Phase 6.1: enriched per-match row used by the view-layer
+    `recent_form_table_two_column` widget. Same shape as `RecentMatch`
+    plus odds + completion-status badge. Not an LLM-callable schema —
+    the view layer builds it directly from matchstat or Sackmann data."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    match_date: date
+    opponent_name: str
+    result: Literal["W", "L"]
+    surface: str | None = None
+    tournament_name: str | None = None
+    round_name: str | None = None
+    score: str | None = None
+    odds_self: float | None = Field(default=None, ge=1.0)
+    odds_opponent: float | None = Field(default=None, ge=1.0)
+    completion_status: MatchCompletionStatus = "W"
+
+
+class RecentFormPayload(BaseModel):
+    """Wrapper returned by `fetch_recent_n_matches` so the view layer can
+    render a "matchstat (18m ago)" / "Sackmann (lag up to 7d)" footnote
+    without re-deriving freshness."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    player_id: str
+    player_name: str
+    tour: Tour
+    as_of_date: date
+    matches: list[RecentMatchDetail] = Field(default_factory=list)
+    data_source: Literal["matchstat", "sackmann"]
+    fetched_at: datetime
+    matchstat_quota_used: int | None = None
+    matchstat_quota_cap: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.1: NewsItem — the LLM's only output channel for prose.
+# ---------------------------------------------------------------------------
+
+
+class NewsItem(BaseModel):
+    """One piece of news returned by the bounded LLM analyst. Title + URL
+    + snippet come from Tavily; `source_domain`, `published_date`,
+    `player_subject`, `category` are the LLM's structured tags.
+
+    `published_date` is a free-form string (not parsed `date`) because
+    Tavily occasionally returns partial dates like "2026" or "May 2026"
+    that don't fit `date.fromisoformat`. The post-validate filter in the
+    agent loop parses these heuristically when deciding whether to drop
+    the item for being older than 32 days."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    title: str = Field(min_length=1, max_length=300)
+    url: str = Field(min_length=1, max_length=2000)
+    snippet: str = Field(min_length=1, max_length=2000)
+    published_date: str | None = Field(default=None, max_length=64)
+    source_domain: str = Field(min_length=1, max_length=200)
+    player_subject: NewsPlayerSubject
+    category: NewsCategory
+
+
 class RecentMatch(BaseModel):
     """One row in `RecentFormSummary.last_matches`. Result is from the
     perspective of the player named in the parent summary."""
@@ -208,7 +381,13 @@ class RecentMatch(BaseModel):
 class RecentFormSummary(BaseModel):
     """Recent-N form, newest-first. `n_returned` may be less than the
     requested `n_matches` for debutants or returning players — the agent
-    handles that as context (failure-mode 2)."""
+    handles that as context (failure-mode 2).
+
+    `latest_match_date` and `data_freshness_warning` exist so the agent
+    can detect the Phase 2 cold-data lag (Sackmann lags 1-7 days for active
+    tour players). Without them, the agent treats whatever is in the DB
+    as "current form" even when the player has played matches in the gap.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -224,6 +403,14 @@ class RecentFormSummary(BaseModel):
     win_pct: float | None = Field(default=None, ge=0.0, le=1.0)
 
     last_matches: list[RecentMatch] = Field(default_factory=list)
+
+    # Newest `match_date` across `last_matches`. None for debutants.
+    latest_match_date: date | None = Field(default=None)
+    # Set when `as_of_date - latest_match_date > 7 days`. The agent MUST
+    # surface this in `caveats` and prefer web search over the DB record
+    # for any "current form" claim. Phase 2 documented a 1-7 day Sackmann
+    # ingestion lag; this field exposes it to the prompt.
+    data_freshness_warning: str | None = Field(default=None)
 
 
 class RankingSnapshot(BaseModel):

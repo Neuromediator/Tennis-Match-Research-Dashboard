@@ -34,3 +34,9 @@ X_RAPIDAPI_KEY: str | None = os.environ.get("X_RAPIDAPI_KEY")
 # can replace native search at ~5x lower cost without quality loss. Free tier:
 # 1000 searches/month, no card.
 TAVILY_API_KEY: str | None = os.environ.get("TAVILY_API_KEY")
+
+# Phase 6.2: The Odds API (`the-odds-api.com`) — pre-match h2h odds for
+# upcoming ATP/WTA fixtures. Free tier 500 credits/month, email-only
+# signup. Separate from `X_RAPIDAPI_KEY` (matchstat is a different
+# vendor on a different account).
+THE_ODDS_API_KEY: str | None = os.environ.get("THE_ODDS_API_KEY")

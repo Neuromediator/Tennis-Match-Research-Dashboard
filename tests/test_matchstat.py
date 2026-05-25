@@ -386,3 +386,170 @@ def test_matchstat_error_body_field_carries_full_text() -> None:
         client.calendar("atp", 2026)
 
     assert exc_info.value.body == body
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.1: per-player past-matches and H2H endpoints.
+# ---------------------------------------------------------------------------
+
+
+def _rich_match_payload(
+    match_id: str,
+    *,
+    p1_id: int,
+    p2_id: int,
+    winner: int,
+    result: str,
+    surface: str = "Clay",
+    tournament_name: str = "Roland Garros",
+    round_name: str = "R32",
+    odd1: str | None = "1.65",
+    odd2: str | None = "2.20",
+) -> dict[str, Any]:
+    return {
+        "id": match_id,
+        "date": "2026-05-20T12:00:00.000Z",
+        "roundId": 1,
+        "round": {"id": 1, "name": round_name},
+        "tournamentId": 999,
+        "tournament": {
+            "id": 999,
+            "name": tournament_name,
+            "court": {"id": 1, "name": surface},
+            "rank": {"id": 1, "name": "Grand Slam"},
+            "countryAcr": "FRA",
+            "tier": "Grand Slam",
+        },
+        "player1Id": p1_id,
+        "player2Id": p2_id,
+        "player1": {"id": p1_id, "name": "Player A", "countryAcr": "NOR"},
+        "player2": {"id": p2_id, "name": "Player B", "countryAcr": "RUS"},
+        "matchWinner": winner,
+        "result": result,
+        "bestOf": 5,
+        "odd1": odd1,
+        "odd2": odd2,
+    }
+
+
+def test_player_past_matches_parses_rich_row() -> None:
+    payload = {
+        "data": [
+            _rich_match_payload("12345678", p1_id=100, p2_id=200, winner=1, result="6-4 6-3 6-2"),
+            _rich_match_payload("12345679", p1_id=100, p2_id=300, winner=2, result="3-6 6-7"),
+        ],
+        "hasNextPage": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/tennis/v2/atp/player/past-matches/100"
+        assert request.url.params.get("pageSize") == "10"
+        assert "tournament.court" in (request.url.params.get("include") or "")
+        return httpx.Response(200, json=payload)
+
+    with _make_client(handler) as client:
+        page = client.player_past_matches("atp", 100)
+
+    assert page.has_next_page is False
+    assert len(page.data) == 2
+    first = page.data[0]
+    assert first.id == "12345678"
+    assert first.match_winner == 1
+    assert first.tournament is not None
+    assert first.tournament.court is not None
+    assert first.tournament.court.name == "Clay"
+    assert first.round is not None
+    assert first.round.name == "R32"
+    assert first.odd1 == "1.65"
+    assert first.odd2 == "2.20"
+
+
+def test_h2h_canonical_path_and_parsing() -> None:
+    payload = {
+        "data": [
+            _rich_match_payload(
+                "55555555",
+                p1_id=100,
+                p2_id=200,
+                winner=1,
+                result="7-5 6-7(4) 6-2",
+                surface="Hard",
+                tournament_name="US Open",
+                round_name="QF",
+            ),
+        ],
+        "hasNextPage": False,
+    }
+
+    seen_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json=payload)
+
+    with _make_client(handler) as client:
+        page = client.h2h("atp", 100, 200)
+
+    assert seen_paths == ["/tennis/v2/atp/h2h/matches/100/200"]
+    assert page.data[0].tournament is not None
+    assert page.data[0].tournament.name == "US Open"
+    assert page.data[0].result == "7-5 6-7(4) 6-2"
+
+
+def test_h2h_empty_when_never_met() -> None:
+    """matchstat returns an empty `data` array when two players have never
+    met. Pydantic must accept this as `has_next_page=False, data=[]` (a
+    legitimate "no H2H history" signal, not an error)."""
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [], "hasNextPage": False})
+
+    with _make_client(handler) as client:
+        page = client.h2h("wta", 100, 200)
+
+    assert page.data == []
+    assert page.has_next_page is False
+
+
+def test_infer_winner_from_score() -> None:
+    from tennis_predictor.data.matchstat import infer_winner_from_score
+
+    # Player 1 wins 2-0
+    assert infer_winner_from_score("6-3 6-4") == 1
+    # Player 2 wins 2-1, with a tiebreak set
+    assert infer_winner_from_score("4-6 6-2 4-6") == 2
+    # 3-set: 6-3 / 4-6 / 7-6(4) → P1 wins 2-1 (Khachanov-Trungelliti regression case)
+    assert infer_winner_from_score("6-3 4-6 7-6(4)") == 1
+    # Best-of-5 split / player 2 wins
+    assert infer_winner_from_score("3-6 6-4 4-6 6-3 2-6") == 2
+    # Unparseable → None
+    assert infer_winner_from_score(None) is None
+    assert infer_winner_from_score("") is None
+    assert infer_winner_from_score("not a score") is None
+
+
+def test_winner_index_prefers_matchwinner_falls_back_to_score() -> None:
+    from tennis_predictor.data.matchstat import winner_index
+
+    # `match_winner` set authoritatively wins over score parsing.
+    assert winner_index(2, "6-0 6-0") == 2
+    # `match_winner` None → fall back to score.
+    assert winner_index(None, "6-3 4-6 7-6(4)") == 1
+    # Neither signal → None.
+    assert winner_index(None, None) is None
+    # Junk value in match_winner → fall back.
+    assert winner_index(0, "6-3 6-4") == 1
+
+
+def test_parse_completion_status_recognises_sentinels() -> None:
+    from tennis_predictor.data.matchstat import parse_completion_status
+
+    assert parse_completion_status("6-4 6-3") == "W"
+    assert parse_completion_status("6-4 2-1 ret.") == "RET"
+    assert parse_completion_status("6-4 retired") == "RET"
+    assert parse_completion_status("w/o") == "WO"
+    assert parse_completion_status("walkover") == "WO"
+    assert parse_completion_status("6-0 def.") == "DEF"
+    # None / empty are treated as a regular completion — see docstring.
+    assert parse_completion_status(None) == "W"
+    assert parse_completion_status("") == "W"

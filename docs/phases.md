@@ -278,9 +278,11 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 6 — Streamlit app
+## Phase 6 — Streamlit app  ✅ complete (superseded by 6.1 for the LLM-analyst surface)
 
-**Entry:** phase 5.1 exit criteria met.
+**Entry:** phase 5.1 exit criteria met. Pre-implementation contract:
+`docs/tutorials/phase_6_notes.md`. Implementation results:
+`docs/tutorials/phase_6_results.md`.
 
 **Deliverables:**
 - **Home page — upcoming matches.** Sourced from `scheduled_matches`. Grouped by tournament, sorted by scheduled start. Each row links to its prediction page. This is the primary entry point — most users arrive wanting "predict tonight's matches", not "type in two player names."
@@ -297,6 +299,133 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 - `uv run streamlit run src/tennis_predictor/app/main.py` works end to end.
 - Manual smoke test of the golden path (open home → pick a fixture → see prediction + news) and at least two edge cases: a player with no recent matches; hot API marked stale.
 - Cost monitor on the Dashboard page reads non-zero data from `llm_traces` for the smoke-test predictions.
+
+**Implementation status (2026-05-23):**
+- App package shipped at `src/tennis_predictor/app/` — four pages
+  (`home`, `prediction`, `custom`, `dashboard`), shared helpers
+  (`db.py`, `context.py`, `widgets.py`), router in `main.py`.
+- `scripts/predict_match.py` now imports context builders from
+  `app/context.py` (single source of truth).
+- 423 default tests pass (387 → 423, +36 covering context + widgets + TZ + dtype).
+- Quality gates clean: ruff / format / pyright / pytest.
+- Manual smoke surfaced LLM-analyst quality problems (year-mixing,
+  stale "current form", hallucinated "defended title") that prompt
+  rules could not eliminate — see Phase 6.1 for the structural fix.
+
+---
+
+## Phase 6.1 — LLM analyst v2 + UI refactor  ✅ implementation complete; superseded by 6.2 product re-scope
+
+**Entry:** Phase 6 implementation complete; user feedback documented the LLM-analyst failure modes that motivate this phase. Full design document: `docs/tutorials/phase_6_1_notes.md`. Results: `docs/tutorials/phase_6_1_results.md` (skeleton).
+
+**Motivation.** Phase 6 shipped an LLM that produced freeform `narrative` over a generic tool set. Live use showed three classes of failure that no prompt iteration fixed: (a) snippet verbs read as present-tense made articles from prior seasons appear current ("Ruud just won Geneva" — 2024 article), (b) DB recent-form was synthesised around even when `data_freshness_warning` was set (Safiullin shown 10-0 missing his RG-quali loss), (c) plausible-sounding prose like "defended his title" appeared without backing. The structural fix: take prose synthesis out of the LLM's hands; render H2H, surface-Elo, and last-8-matches deterministically from typed tool outputs; constrain the LLM to **only** dated, attributed news items with a category whitelist.
+
+**Architectural contract** (locked in `docs/tutorials/phase_6_1_notes.md` before implementation):
+
+- `AgentResponse` drops `narrative`, `confidence_band`, `caveats`, `key_factors`. New shape: `news_items: list[NewsItem] + news_lookup_status: Literal["ok","no_results","failed"]`.
+- LLM-callable tool surface shrinks to: `get_model_prediction` (mandatory), `get_head_to_head` (now with per-match detail + odds + completion status), **new** `get_surface_elo` (one call returns both players + diff + baseline%), `web_search` (scoped 32-day window + category whitelist), `submit_analysis`.
+- LLM-callable tools removed: `get_player_stats`, `get_recent_form`, `get_player_ranking`, `fetch_url`.
+- Recent form (8 last matches per player) is rendered **directly by the view layer** — not via an LLM tool call.
+- **matchstat second use case**: per-player past-matches + H2H endpoints added to `MatchstatClient`. On-demand with 24h DuckDB cache (`matchstat_player_recent_cache`, `matchstat_h2h_cache`) and quota tracking (`matchstat_quota`, raising `MatchstatBudgetExceeded` at 480/500). On exhaustion → graceful Sackmann fallback with visible banner.
+- Category whitelist for `NewsItem`: `injury / withdrawal / illness / result / coach_change / personal`. `other` is a filtered-out sentinel.
+- `MATCHSTAT_SOURCE_TZ` default changes `UTC → Europe/Moscow` (matchstat empirically sends Moscow-local time labelled as Z). One-shot migration: `scripts/clear_scheduled_matches.py` + `refresh_hot.py` re-run.
+- Display format for match times: `"Sun, May 25 — 11:00 CEST (09:00 UTC)"`.
+
+**Deliverables:**
+
+- Schema migrations: `matchstat_player_recent_cache`, `matchstat_h2h_cache`, `matchstat_quota` tables.
+- `MatchstatClient.player_past_matches(tour, player_id)` + `MatchstatClient.h2h(tour, p1_id, p2_id)`.
+- `MatchstatLiveFetcher` (cache + quota + fallback) in `src/tennis_predictor/data/matchstat_live.py`.
+- Rewritten `get_head_to_head` LLM tool returning detailed H2H matches with odds + completion status.
+- New `get_surface_elo` LLM tool.
+- New `fetch_recent_n_matches` helper for the view layer (matchstat-first, Sackmann fallback).
+- `AgentResponse` rewritten per drop list. `submit_analysis` schema updated.
+- `SYSTEM_PROMPT` rewritten with the new bounded scope, 32-day window, category whitelist.
+- `TennisAgent` budget tightened: `max_tool_iterations=4`, `max_web_searches=2`, `fetch_url` retired from this path.
+- Streamlit views: `prediction.py` redesigned per the layout in `phase_6_1_notes.md` (Step 8); `custom.py` reduced to 3 inputs with player autocomplete (Step 9, 10); Home page TZ labelling fixed (Step 11).
+- New widgets in `app/widgets.py`: `player_autocomplete`, `recent_form_table_two_column`, `h2h_block`, `news_block`, `surface_elo_block`, `format_match_time_for_display`.
+- Re-recorded LLM fixture tests (`tests/fixtures/llm/*.json`) for the new 2-3-call agent loop and new `AgentResponse` schema.
+
+**Exit:**
+
+- All quality gates green (ruff / format / pyright / pytest); test count documented in `phase_6_1_results.md`.
+- Manual smoke: predicting the Ruud-Safiullin / Jacquet-Trungelliti fixtures that motivated this phase yields output where every fact has a visible source + date and no year-mixing.
+- Free-tier matchstat budget verified: a fresh prediction burns ≤ 3 reqs; cache hit on retry within 24h burns 0; quota counter shows accurate `requests_used`.
+- TZ correctness: Home page shows a match time that matches the corresponding `atptour.com` / `wtatennis.com` schedule entry minute-for-minute.
+
+**Out of scope** (decided in `phase_6_1_notes.md` Part 3): live X/Twitter, per-match aces/BP stats, per-tournament TZ inference, confidence intervals on the model probability, any return of narrative synthesis under stricter rules.
+
+---
+
+## Phase 6.2 — Re-scope: predictor → tennis context dashboard  🟡 design locked, implementation pending
+
+**Entry:** Phase 6.1 close-out manual smoke (2026-05-25) exposed that the calibrated LightGBM probability is unreliable on real top matches:
+- Cina-Opelka: model 37% on the actual favourite (Cina), market 64% — **inverted favourite**
+- Sinner-Djokovic Clay: model 67% Sinner, market 93% — **26pp gap**
+- Kasatkina vs X: model 55%, market 69% — 14pp gap
+
+Average Brier 0.21 vs market 0.20 in Phase 4 masked these tail failures because Brier averages across thousands of matches and is dominated by easy predictions (top-10 vs WTA #80). The trained model **cannot decay surface-Elo for inactive players** (Djokovic's clay-Elo froze 2025-05-26), **cannot accelerate for hot streaks** (Sinner's 5 Masters in a row at K=32 only added ~+100), **cannot handle injury returns** (Opelka's 2022 Elo still anchors). These are structural Elo limits, not training data issues; they require feature-engineering work that is deferred.
+
+**Strategy:** instead of trying to fix the model, change what the product IS. Phase 6.2 re-scopes from "predictor" to "tennis match research dashboard." Full design document: `docs/tutorials/phase_6_2_notes.md`. Results: `docs/tutorials/phase_6_2_results.md` (TBD).
+
+**Product framing shift:**
+- "A working tool that gives calibrated win probabilities" → "Tennis match research dashboard — see the model's view alongside market, surface-Elo, recent form, and LLM news context"
+- The model probability stops being THE answer; it becomes one column in a comparison row.
+- When model disagrees with market by > 10pp, the dashboard renders a structural explanation (stale surface-Elo, activity gap, returning veteran). Deterministic checks, not LLM-generated.
+
+**Architectural contract** (locked in `docs/tutorials/phase_6_2_notes.md`):
+
+- **New data source: The Odds API** (`the-odds-api.com`). Free 500 credits/month, email-only signup. Auto-fetched pre-match odds; user never enters odds manually. New `pre_match_odds` DuckDB table.
+- **Pinnacle wrapper on RapidAPI considered and rejected** — no readable public docs, live probing surfaced only 2 of N endpoints. The Odds API exposes Pinnacle's price as one of its `bookmakers[]` for EU region, so the sharp-line preference is preserved indirectly (we extract Pinnacle into dedicated columns alongside the median across books).
+- **Per-tournament sport keys** (`tennis_atp_french_open`, `tennis_wta_madrid`, etc.) — daily refresh discovers active keys via `GET /v4/sports/?all=false`, then iterates each.
+- **Quota strategy:** daily batch + lazy 24h cache on Prediction-page load. NO per-match retry when match < 1h to start. Expected 150-210 credits/month against 500 cap.
+- **Fallback chain** when The Odds API has no row: (1) Tavily search + regex decimal-odds extract, flagged `source='tavily'` in UI, (2) UI shows "Market: odds unavailable" explicitly.
+- **matchstat H2H endpoint was wrong all of Phase 6.1.** Correct path per `tennisapidoc.matchstat.com/h2h` is `GET /atp/h2h/matches/{a}/{b}` (returns `data:` with `match_winner` + `result` + `odd1/2`), not `/atp/fixtures/h2h/{a}/{b}` (which returns upcoming fixtures and silently produced `data:[]` for Sinner-Djokovic). One-line URL fix + `result_type=='completed'` defensive filter eliminates the Svitolina-Bondar "score unknown" bug.
+- **Navigation contract:** "← Back to home" button at top of every non-Home page; clicking calls `st.switch_page("views/home.py")` explicitly. Browser back continues to work but no longer re-triggers `agent.predict()` because `AgentResponse` is persisted in `st.session_state[f"prediction::{match_id}"]` on first run.
+- **Comparison row UI:** four-line table per Prediction-page header — Pinnacle (market), our model, surface-Elo, diff-to-market column. Margin-stripped probabilities so all three rows sum to 1.
+- **"Why model differs" panel** rendered when |model - market| > 10pp. Three deterministic causes checked in order: (1) activity asymmetry, (2) stale surface-Elo (> 180 days), (3) career-length asymmetry. No LLM-generated explanation — would re-introduce Phase 6 narrative bias.
+- **Hard rule changes in CLAUDE.md:**
+  - #3 broadened to cover `pre_match_odds` (display + calibration only, never training).
+  - #10 relaxed for UI: deterministic blocks render even if agent fails; only the agent invocation itself is blocked on missing model.
+  - #11 **NEW:** honest framing in copy (never claim "calibrated prediction" in UI text).
+  - #12 **NEW:** acceptance test must include 10-match reality walkthrough (model vs market vs surface-Elo vs subjective rating ≥ 3.5/5; any unexplained inverted favourite = phase reopens).
+
+**Deliverables:**
+
+- Step 1: copy / framing rewrite — page titles, sidebar tagline, README, CLAUDE.md.
+- Step 2: The Odds API integration — `src/tennis_predictor/data/odds_api.py`, `pre_match_odds` schema, `scripts/refresh_pre_match_odds.py`, sport-key discovery via `/v4/sports/?all=false`, name-reconciliation matcher (`home_team`/`away_team` vs `scheduled_matches.player1_name`/`player2_name`), Tavily fallback path.
+- Step 3: comparison-row layout in `views/prediction.py` + "why model differs" deterministic panel.
+- Step 4.1: matchstat H2H endpoint fix in `matchstat.py` (`/fixtures/h2h/` → `/h2h/matches/`) + `result_type` filter.
+- Step 4.2: completed-in-upcoming filter in `views/home.py` (filter `scheduled_start_utc > now - 1h`).
+- Step 4.3: `session_state[f"prediction::{match_id}"]` persistence + "← Back to home" buttons on all non-Home pages.
+- Step 5: news block repositioning (move above recent form, closer to comparison row).
+- Step 6: header rewrites + README rewrite for honest framing.
+- Step 7: Dashboard scoreboard reading last 20 model-vs-market gaps from `pre_match_odds` × `llm_traces`.
+
+**Exit (all required):**
+
+- All quality gates green (ruff / format / pyright / pytest).
+- **10-match reality test passed** — user walks through 10 current upcoming matches, records (model, market, surface-Elo, "why differs" triggered, 1-5 rating). Average rating ≥ 3.5 AND no unexplained inverted favourite.
+- All three UI bugs fixed and verified in browser (matchstat endpoint, completed-in-upcoming, navigation persistence).
+- README + LinkedIn / portfolio framing updated.
+- Pinnacle quota status visible on Dashboard.
+
+**Effort estimate:** 22-32 hours (~3-4 days).
+
+**Out of scope** (decided in `phase_6_2_notes.md` Part 4): surface-Elo time decay (real fix for Sinner-Djokovic — separate phase, requires retrain + walk-forward), market-implied calibration target during training, live odds API integration (Pinnacle covers the need), mobile-responsive layout, public deployment.
+
+**Pre-implementation handoff for new session:**
+- All design decisions locked in `docs/tutorials/phase_6_2_notes.md`. **Read that first.**
+- User has signed up at `the-odds-api.com` (email-only, no credit card). `THE_ODDS_API_KEY` is already in `.env` (do NOT read `.env` — that's a hard rule; just assume it's there).
+- DataMenu Pinnacle Odds API on RapidAPI is **rejected** (no readable docs); design doc records this decision.
+- Sample response shape captured in `phase_6_2_notes.md` Step 2 — parser can be written without further probing.
+- Start order:
+  - **Step 4.1 first** (matchstat H2H endpoint fix — 1 hour, instant win, unblocks user trust in H2H block).
+  - **Step 4.2** (completed-in-upcoming filter — 30 min).
+  - **Step 4.3** (session_state prediction persistence + Back-to-home buttons — 2-3 hours).
+  - Then **Step 2** (The Odds API integration — 6-8 hours; can be done in parallel by a sub-agent if desired).
+  - Then UI: Step 3, 5, 6, 7.
+  - Final: Step Phase-3 acceptance test (10 real matches walkthrough). Phase does not close until this is green.
 
 ---
 

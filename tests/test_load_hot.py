@@ -144,6 +144,157 @@ def test_insert_scheduled_matches_dedupes_on_rerun(db: duckdb.DuckDBPyConnection
     assert total is not None and total[0] == 1
 
 
+def test_insert_scheduled_matches_updates_player_identity_on_id_reuse(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """matchstat occasionally re-uses a fixture_external_id for a
+    different matchup over time (observed: Popyrin-Svajda took over
+    fx_id=1271 from Griekspoor-Arnaldi at Roland Garros 2026).
+
+    The ON CONFLICT DO UPDATE clause must refresh player names and
+    external IDs, otherwise the stale matchup lingers and the new
+    one is silently lost."""
+    resolver = make_resolver(
+        {
+            "Zizou Bergs": "ATP_37741",
+            "Arthur Gea": "ATP_87277",
+            "Alexei Popyrin": "ATP_34233",
+            "Zachary Svajda": "ATP_73620",
+        }
+    )
+    # First refresh: matchstat says fx_id=1271 is Bergs-Gea.
+    insert_scheduled_matches(db, [make_fixture(id=1271)], tour="ATP", resolve_player=resolver)
+    # Second refresh: matchstat re-uses fx_id=1271 for Popyrin-Svajda
+    # (different players, possibly different time / round).
+    reused = make_fixture(
+        id=1271,
+        player1Id=34233,
+        player2Id=73620,
+        player1={"id": 34233, "name": "Alexei Popyrin", "countryAcr": "AUS"},
+        player2={"id": 73620, "name": "Zachary Svajda", "countryAcr": "USA"},
+    )
+    insert_scheduled_matches(db, [reused], tour="ATP", resolve_player=resolver)
+
+    row = db.execute(
+        "SELECT player1_name, player2_name, player1_external_id, player2_external_id "
+        "FROM scheduled_matches WHERE fixture_external_id = '1271'"
+    ).fetchone()
+    assert row == ("Alexei Popyrin", "Zachary Svajda", "34233", "73620")
+
+
+def test_insert_scheduled_matches_stores_start_time_as_naive_utc(
+    db: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """matchstat returns ISO-8601 with `Z` (UTC). DuckDB's TIMESTAMP is
+    naive — passing the tz-aware value triggers a silent host-local
+    conversion that previously shifted every match time by the system's
+    UTC offset.
+
+    Phase 6.1 changed the default `MATCHSTAT_SOURCE_TZ` to
+    `Europe/Moscow` (matchstat empirically sends MSK-as-Z). This test
+    pins the *other* TZ bug — the DuckDB tz-aware-to-naive silent
+    shift — so we explicitly set `UTC` here to isolate it from the
+    matchstat correction.
+    """
+    monkeypatch.setenv("MATCHSTAT_SOURCE_TZ", "UTC")
+    resolver = make_resolver({"Zizou Bergs": "x", "Arthur Gea": "y"})
+    insert_scheduled_matches(
+        db,
+        [make_fixture(date="2026-05-25T09:00:00.000Z")],
+        tour="ATP",
+        resolve_player=resolver,
+    )
+    row = db.execute("SELECT scheduled_start_utc FROM scheduled_matches").fetchone()
+    assert row is not None
+    stored = row[0]
+    assert stored.tzinfo is None
+    assert stored.year == 2026
+    assert stored.month == 5
+    assert stored.day == 25
+    assert stored.hour == 9
+    assert stored.minute == 0
+
+
+def test_insert_scheduled_matches_default_tz_applies_moscow_correction(
+    db: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 6.1: the default behaviour with no env override is to treat
+    matchstat times as Europe/Moscow (matches the +3h shift observed in
+    production). 12:00 'Z' should land as 09:00 real UTC in the DB."""
+    monkeypatch.delenv("MATCHSTAT_SOURCE_TZ", raising=False)
+    resolver = make_resolver({"Zizou Bergs": "x", "Arthur Gea": "y"})
+    insert_scheduled_matches(
+        db,
+        [make_fixture(date="2026-05-25T12:00:00.000Z")],
+        tour="ATP",
+        resolve_player=resolver,
+    )
+    row = db.execute("SELECT scheduled_start_utc FROM scheduled_matches").fetchone()
+    assert row is not None
+    stored = row[0]
+    assert stored.hour == 9
+    assert stored.minute == 0
+
+
+def test_insert_scheduled_matches_applies_matchstat_source_tz(
+    db: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """matchstat's `Z` is empirically NOT real UTC (user-confirmed 2026-05-24
+    that `12:00Z` is really 09:00 UTC = a +3h shift, consistent with the
+    backend storing Moscow time). Setting `MATCHSTAT_SOURCE_TZ=Europe/Moscow`
+    must subtract that offset on ingest."""
+    monkeypatch.setenv("MATCHSTAT_SOURCE_TZ", "Europe/Moscow")
+    resolver = make_resolver({"Zizou Bergs": "x", "Arthur Gea": "y"})
+    insert_scheduled_matches(
+        db,
+        [make_fixture(date="2026-05-25T12:00:00.000Z")],
+        tour="ATP",
+        resolve_player=resolver,
+    )
+    row = db.execute("SELECT scheduled_start_utc FROM scheduled_matches").fetchone()
+    assert row is not None
+    stored = row[0]
+    # 12:00 Moscow time (UTC+3) = 09:00 real UTC.
+    assert stored.hour == 9
+    assert stored.minute == 0
+
+
+def test_insert_scheduled_matches_rerun_corrects_mutable_fields(
+    db: duckdb.DuckDBPyConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-ingesting the same fixture with new start time / round / surface
+    must update the stored row. Previously ON CONFLICT DO NOTHING locked
+    in any wrong-tz value forever; now we DO UPDATE the mutable fields.
+
+    Phase 6.1: this test pins UPSERT mutability, which is independent
+    of the TZ-correction default; set `UTC` so the assertions stay
+    written in raw wall-clock terms."""
+    monkeypatch.setenv("MATCHSTAT_SOURCE_TZ", "UTC")
+    resolver = make_resolver({"Zizou Bergs": "x", "Arthur Gea": "y"})
+    insert_scheduled_matches(
+        db,
+        [make_fixture(date="2026-05-25T09:00:00.000Z")],
+        tour="ATP",
+        resolve_player=resolver,
+    )
+    insert_scheduled_matches(
+        db,
+        [make_fixture(date="2026-05-25T11:30:00.000Z", round={"id": 5, "name": "R16"})],
+        tour="ATP",
+        resolve_player=resolver,
+    )
+    row = db.execute("SELECT scheduled_start_utc, round_name FROM scheduled_matches").fetchone()
+    assert row is not None
+    stored_start, round_name = row
+    assert stored_start.hour == 11
+    assert stored_start.minute == 30
+    assert round_name == "R16"
+
+
 def test_insert_scheduled_matches_leaves_canonical_null_when_unresolved(
     db: duckdb.DuckDBPyConnection,
 ) -> None:

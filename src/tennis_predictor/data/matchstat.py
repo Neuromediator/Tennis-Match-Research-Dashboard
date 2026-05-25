@@ -30,7 +30,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 API_HOST = "tennis-api-atp-wta-itf.p.rapidapi.com"
 BASE_URL = f"https://{API_HOST}/tennis/v2"
@@ -125,10 +125,22 @@ class Fixture(_Permissive):
 
     `id` is the fixture-row id (small integer). Note this is NOT the same
     identifier as `Match.id` from tournament/results.
+
+    Two time-related fields (Phase 6.2 finding via the matchstat docs):
+    - `date`: when matchstat has the on-court time, this carries it.
+      When the match is on the schedule but the time hasn't been set
+      yet (typical for fixtures published > 24h ahead), matchstat
+      returns a day-level placeholder of `YYYY-MM-DDT12:00:00.000Z`.
+    - `time_game`: a secondary timestamp described by the docs as
+      "the last update time or an alternate on-court time when date
+      is a day-level value only". Empirically `null` on every Roland
+      Garros 2026 fixture we sampled — we read it through so a future
+      change in matchstat's convention doesn't silently regress.
     """
 
     id: int
     date: datetime | None = None
+    time_game: datetime | None = Field(default=None, alias="timeGame")
     round_id: int | None = Field(default=None, alias="roundId")
     player1_id: int = Field(alias="player1Id")
     player2_id: int = Field(alias="player2Id")
@@ -139,6 +151,32 @@ class Fixture(_Permissive):
     player2: FixturePlayer
     tournament: FixtureTournament | None = None
     round: FixtureRound | None = None
+
+
+def fixture_on_court_time(
+    date_val: datetime | None, time_game_val: datetime | None
+) -> datetime | None:
+    """Pick the most authoritative on-court time for a fixture.
+
+    matchstat publishing convention (Phase 6.2 finding):
+    - When the on-court time is confirmed, it's in `date`; `timeGame`
+      is null.
+    - When the match is on the schedule but the time hasn't been set
+      yet, `date` is a day-level placeholder `YYYY-MM-DDT12:00:00Z`
+      and `timeGame` may carry a more precise time (rare in practice).
+
+    Returns `time_game` when set, otherwise `date`. Caller is
+    responsible for detecting the day-level-placeholder pattern via
+    `is_day_level_placeholder`."""
+    return time_game_val if time_game_val is not None else date_val
+
+
+def is_day_level_placeholder(dt: datetime | None) -> bool:
+    """True when `dt` looks like matchstat's day-level placeholder
+    (`YYYY-MM-DDT12:00:00Z`). Treated as "time TBD" by the UI."""
+    if dt is None:
+        return False
+    return dt.hour == 12 and dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
 
 
 class FixturesPage(_Permissive):
@@ -180,6 +218,160 @@ class TournamentResults(_Permissive):
     doubles: list[Match] = Field(default_factory=list)
     qualifying: list[Match] = Field(default_factory=list)
     doubles_qualifying: list[Match] = Field(default_factory=list, alias="doublesQualifying")
+
+
+# Phase 6.1: per-player completed-match history. Same row shape as
+# `Match` but enriched with tournament + round metadata so the Prediction
+# page can render "8 last matches" without joining anything else.
+class RichMatchTournament(_Permissive):
+    id: int
+    name: str | None = None
+    court: Court | None = None
+    rank: Rank | None = None
+    country_acr: str | None = Field(default=None, alias="countryAcr")
+    tier: str | None = None
+
+
+class RichMatchRound(_Permissive):
+    id: int | None = None
+    name: str | None = None
+
+
+class RichMatch(_Permissive):
+    """One row from `/{tour}/player/past-matches/{id}` or
+    `/{tour}/h2h/matches/{a}/{b}`. matchstat exposes `tournament`,
+    `round`, `player1`, `player2`, `matchWinner`, `result`, `odd1`,
+    `odd2`, `resultType`. `result` is a space-separated score; trailing
+    tokens like `"ret."` or `"w/o"` indicate completion status — parsed
+    by `parse_completion_status` rather than typed at the wire layer.
+    `result_type` (the matchstat field) is the wire-level completion
+    flag — observed value `"completed"`; we surface it so consumers can
+    defensively filter to completed rows only (Phase 6.2 fix — see
+    `recent_form_live.fetch_h2h_summary`).
+
+    `id` is normalised to `str` because the two endpoints disagree on
+    the wire type: `player/past-matches/{id}` returns 8-digit strings,
+    earlier `fixtures/h2h/{a}/{b}` returned small integers. A
+    `field_validator` coerces both to a string so downstream code can
+    rely on a single type."""
+
+    id: str
+    date: datetime | None = None
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id_to_str(cls, value: Any) -> Any:
+        if isinstance(value, int):
+            return str(value)
+        return value
+
+    round_id: int | None = Field(default=None, alias="roundId")
+    round: RichMatchRound | None = None
+    tournament_id: int = Field(alias="tournamentId")
+    tournament: RichMatchTournament | None = None
+    player1_id: int = Field(alias="player1Id")
+    player2_id: int = Field(alias="player2Id")
+    player1: FixturePlayer
+    player2: FixturePlayer
+    match_winner: int | None = Field(default=None, alias="matchWinner")
+    result: str | None = None
+    result_type: str | None = Field(default=None, alias="resultType")
+    best_of: int | None = Field(default=None, alias="bestOf")
+    odd1: str | None = None
+    odd2: str | None = None
+
+
+class RichMatchesPage(_Permissive):
+    """`/{tour}/player/past-matches/{id}` and `/{tour}/h2h/matches/{a}/{b}`
+    share this paginated envelope. `has_next_page` mirrors the fixtures
+    pager — callers loop until False if they need more than one page,
+    though the prediction layer only ever asks for the first."""
+
+    data: list[RichMatch] = Field(default_factory=list)
+    has_next_page: bool = Field(default=False, alias="hasNextPage")
+
+
+# Completion-status sentinels. We only need to distinguish "completed" from
+# the three irregular endings; finer granularity (e.g. ret. set-1 vs ret.
+# set-3) is parsed on demand from the score string.
+CompletionStatus = Literal["W", "RET", "WO", "DEF"]
+
+
+def infer_winner_from_score(result: str | None) -> int | None:
+    """Return 1 if `player1` won, 2 if `player2` won, or None if the
+    winner cannot be determined from the score string.
+
+    Phase 6.2 fix — matchstat's `/h2h/matches/...` and `/player/past-
+    matches/...` endpoints frequently return `matchWinner: null` for
+    older completed matches (observed across multiple Roland Garros
+    2026 rows, plus 2016 Barcelona Open Q3 Khachanov-Trungelliti).
+    Before this helper, `winner_a = match.match_winner == 1` silently
+    evaluated to `False` and we attributed the win to player2,
+    producing reverse H2H records.
+
+    Parsing rules:
+    - Score is whitespace-separated set scores like `"6-3 4-6 7-6(4)"`.
+    - Strip tiebreak parens `(7)`.
+    - For each set, count the winner by the larger leading number.
+    - Match winner = whoever won more sets. Tie or unparseable → None
+      (caller's responsibility to fall back further, e.g. to "unknown")."""
+    if not result:
+        return None
+    p1_sets = 0
+    p2_sets = 0
+    for raw in result.split():
+        bare = raw.split("(", 1)[0]
+        parts = bare.split("-")
+        if len(parts) != 2:
+            continue
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if a > b:
+            p1_sets += 1
+        elif b > a:
+            p2_sets += 1
+    if p1_sets > p2_sets:
+        return 1
+    if p2_sets > p1_sets:
+        return 2
+    return None
+
+
+def winner_index(match_winner: int | None, result: str | None) -> int | None:
+    """Authoritative winner-side resolver: `match_winner` first
+    (matchstat's own field), then `infer_winner_from_score(result)`
+    as a fallback when matchstat omits it. Returns 1, 2, or None."""
+    if match_winner in (1, 2):
+        return match_winner
+    return infer_winner_from_score(result)
+
+
+def parse_completion_status(result: str | None) -> CompletionStatus:
+    """Heuristic parser for matchstat's `result` field.
+
+    Recognised sentinels (case-insensitive, anywhere in the string):
+    - "ret." / "retired" / "ret " → RET
+    - "w/o" / "wo" (as a token) / "walkover" → WO
+    - "def." / "defaulted" → DEF
+    - anything else (including None or empty) → W
+
+    None / empty is treated as W rather than raising because matchstat
+    occasionally omits `result` for very recent completions while the row
+    is being post-processed; the row is still a real win and we don't
+    want to lose it from "last 8 matches".
+    """
+    if not result:
+        return "W"
+    lowered = result.lower()
+    if "ret" in lowered:
+        return "RET"
+    if "walkover" in lowered or " w/o" in f" {lowered}" or lowered.startswith("w/o"):
+        return "WO"
+    if "def" in lowered:
+        return "DEF"
+    return "W"
 
 
 class RankingPlayer(_Permissive):
@@ -274,6 +466,40 @@ class MatchstatClient:
         payload = self._get_json(f"/{tour}/fixtures/{match_date.isoformat()}", params)
         return FixturesPage.model_validate(payload)
 
+    def fixtures_for_tournament(
+        self,
+        tour: TourCode,
+        tournament_id: int,
+        *,
+        singles_only: bool = True,
+        page_size: int = 200,
+        page_no: int = 1,
+    ) -> FixturesPage:
+        """`GET /{tour}/fixtures/tournament/{id}` — all currently-known
+        fixtures for one tournament regardless of round / date.
+
+        Phase 6.2 finding: this endpoint is far more authoritative than
+        `fixtures_for_date` for an in-progress tournament. The per-date
+        endpoint only lists matches whose Order of Play is firmed up
+        (Roland Garros publishes day N's schedule the evening before),
+        so a per-date refresh during a Slam systematically misses R1
+        fixtures whose day hasn't been announced yet AND can return
+        different fixture IDs each call. The per-tournament payload
+        carries every round matchstat knows about — R1, R2, ..., F —
+        at one credit cost per call.
+
+        Page size defaults to 200 because Slam draws are 128 R1 +
+        64 R2 + ... ≈ 250 matches; one page usually suffices."""
+        params: dict[str, str] = {
+            "include": "tournament.court,tournament.rank,round",
+            "pageSize": str(page_size),
+            "pageNo": str(page_no),
+        }
+        if singles_only:
+            params["filter"] = "PlayerGroup:singles"
+        payload = self._get_json(f"/{tour}/fixtures/tournament/{tournament_id}", params)
+        return FixturesPage.model_validate(payload)
+
     def tournament_results(self, tour: TourCode, season_id: int) -> TournamentResults:
         payload = self._get_json(f"/{tour}/tournament/results/{season_id}")
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
@@ -290,6 +516,64 @@ class MatchstatClient:
         payload = self._get_json(f"/{tour}/ranking/singles", params)
         items = payload.get("data", []) if isinstance(payload, dict) else []
         return [RankingEntry.model_validate(item) for item in items]
+
+    def player_past_matches(
+        self,
+        tour: TourCode,
+        player_id: int,
+        *,
+        page_size: int = 10,
+        page_no: int = 1,
+    ) -> RichMatchesPage:
+        """Per-player completed-match history with scores, tournament,
+        round, surface, and pre-match odds. Phase 6.1 uses this to render
+        "last 8 matches" on the Prediction page without the 1-7 day
+        Sackmann lag.
+
+        `page_size=10` is the default rather than 100 because the
+        prediction layer only consumes the first 8 — pulling more is
+        wasted quota."""
+        params = {
+            "include": "tournament.court,tournament.rank,round",
+            "pageSize": str(page_size),
+            "pageNo": str(page_no),
+        }
+        payload = self._get_json(f"/{tour}/player/past-matches/{player_id}", params)
+        return RichMatchesPage.model_validate(payload)
+
+    def h2h(
+        self,
+        tour: TourCode,
+        player_a_id: int,
+        player_b_id: int,
+        *,
+        page_size: int = 50,
+        page_no: int = 1,
+    ) -> RichMatchesPage:
+        """Head-to-head completed-match list between two players, ordered
+        most-recent first by matchstat. Same row shape as
+        `player_past_matches`.
+
+        Endpoint: `/{tour}/h2h/matches/{a}/{b}` (the H2H namespace, not
+        the fixtures namespace). Phase 6.1 was wired to the wrong path
+        `/{tour}/fixtures/h2h/{a}/{b}` which is an upcoming-fixtures
+        endpoint returning `data:[]` for completed history — silently
+        producing the "never met" bug for pairs with established H2H
+        (Sinner-Djokovic, Svitolina-Bondar). Phase 6.2 fix is this URL
+        change plus a `result_type=='completed'` defensive filter in
+        `recent_form_live.fetch_h2h_summary`.
+
+        Orientation note: matchstat is order-agnostic on the path
+        (`/h2h/matches/A/B` and `/h2h/matches/B/A` return the same list).
+        Callers should canonicalise the lex-smaller id first so the
+        cache key collides across orientations."""
+        params = {
+            "include": "tournament.court,tournament.rank,round",
+            "pageSize": str(page_size),
+            "pageNo": str(page_no),
+        }
+        payload = self._get_json(f"/{tour}/h2h/matches/{player_a_id}/{player_b_id}", params)
+        return RichMatchesPage.model_validate(payload)
 
 
 @contextmanager

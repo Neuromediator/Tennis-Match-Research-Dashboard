@@ -1,12 +1,12 @@
-# Tennis Match Probability Predictor
+# Tennis Match Research Dashboard
 
-A working tool that gives calibrated win probabilities for upcoming ATP and WTA tour-level singles matches, paired with an LLM analyst that surfaces relevant context (recent news, injuries, form) for each prediction. Built to be useful in real use, not just to illustrate techniques.
+A research dashboard comparing **market consensus odds** (auto-fetched from The Odds API), a trained **LightGBM model**, and a **surface-Elo baseline** for upcoming ATP and WTA tour-level singles. For each fixture it surfaces an LLM-discovered news block (injuries, withdrawals, coach changes, recent results) and detailed H2H + last-8-matches per player. When the model disagrees with the market by > 10pp, a deterministic panel explains the gap structurally (stale surface-Elo, activity asymmetry, returning veteran). **The model is one signal, not the answer.**
 
-**Not a betting tool — we do not claim to beat the market.**
+**Not a betting tool — we do not claim to beat the market.** Phase 6.2 explicitly reframed the product from "predictor" to "context dashboard" after Phase 6.1 close-out exposed that the calibrated LightGBM probability is unreliable on top matchups (inverted favourites at the Cina-Opelka / Sinner-Djokovic level). See [`docs/tutorials/phase_6_2_notes.md`](docs/tutorials/phase_6_2_notes.md) for the full rescope rationale.
 
-**Status:** Phases 1 (cold data), 2 (hot data), 3 (feature engineering), 4 (modeling: walk-forward + isotonic calibration + market benchmark), and 4.1 (player-metadata + recovery feature expansion to v2 FeatureVector, 39 fields) complete — see [docs/phases.md](docs/phases.md). Phase 5 (LLM agent) is next.
+**Status:** Phases 1-6.1 complete; Phase 6.2 (research-dashboard reframing + The Odds API integration + UI bug bundle) is the current phase — see [docs/phases.md](docs/phases.md). Phase 7 (Fly.io deployment) is next.
 
-**Current production headline numbers** (last-5-fold sample-weighted Brier, post-calibration): ATP LightGBM **0.2101**, WTA LightGBM **0.1954**, both ahead of the Surface-Elo baseline (ATP 0.2220, WTA 0.2180).
+**Aggregate model metrics** (last-5-fold sample-weighted Brier, post-calibration): ATP LightGBM **0.2101**, WTA LightGBM **0.1954**, both ahead of the Surface-Elo baseline (ATP 0.2220, WTA 0.2180). These averages hide tail-failure on top matches — see the reality-test rationale in the Phase 6.2 notes.
 
 See [docs/architecture.md](docs/architecture.md), [docs/methodology.md](docs/methodology.md), and [docs/phases.md](docs/phases.md) for details.
 

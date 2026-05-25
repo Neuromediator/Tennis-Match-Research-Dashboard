@@ -27,6 +27,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from typing import Any
 
 import duckdb
@@ -40,27 +41,18 @@ from tennis_predictor.llm.client import (
     LLMToolUse,
 )
 from tennis_predictor.llm.tools.db_tools import (
-    get_head_to_head,
-    get_player_ranking,
-    get_player_stats,
-    get_recent_form,
-)
-from tennis_predictor.llm.tools.fetch_url import (
-    FETCH_URL_TOOL,
-    FETCH_URL_TOOL_NAME,
-    fetch_url,
+    get_head_to_head_v2,
+    get_surface_elo,
 )
 from tennis_predictor.llm.tools.model_tool import get_model_prediction
 from tennis_predictor.llm.tools.schemas import (
-    FetchUrlInput,
     GetHeadToHeadInput,
     GetModelPredictionInput,
-    GetPlayerRankingInput,
-    GetPlayerStatsInput,
-    GetRecentFormInput,
+    GetSurfaceEloInput,
     MatchContext,
     ModelPrediction,
     ModelUnavailableError,
+    NewsItem,
     PlayerResolutionError,
     TavilyError,
     WebSearchInput,
@@ -96,20 +88,21 @@ _FORCE_SUBMIT_WALL_CLOCK_BUFFER: float = 15.0
 class AgentBudget:
     """Per-`predict()` hard limits.
 
-    The defaults come from CLAUDE.md "Budget discipline" and are tuned for
-    Sonnet 4.6 with ~2250-token cacheable prefix (Phase 5.1 added the two
-    new Tavily tools, ~250 tokens). Override at construction time only for
-    scoped experiments; never inline.
+    Phase 6.1 tightened the iteration / search caps. The happy path is
+    `get_head_to_head` + `get_surface_elo` + `web_search` x 2 +
+    `submit_analysis` = 5 tool calls across 4 iterations (one per
+    non-terminal turn, since the LLM can dispatch tools in parallel
+    within a single turn). `max_fetch_urls` stays in the type so the
+    accounting / refund machinery keeps a stable shape, but the new
+    agent's tool list does NOT register `fetch_url` — meaning the
+    counter never increments in practice.
+    """
 
-    Phase 5.1 added `max_fetch_urls` — separate from `max_web_searches`
-    because they're different kinds of action with different cost profiles
-    (snippet vs full body extraction)."""
-
-    max_tool_iterations: int = 6
+    max_tool_iterations: int = 4
     max_total_tokens: int = 30_000
     max_wall_clock_seconds: float = 120.0
-    max_web_searches: int = 3
-    max_fetch_urls: int = 2
+    max_web_searches: int = 2
+    max_fetch_urls: int = 0
     output_max_tokens: int = 1500
 
 
@@ -434,7 +427,7 @@ class TennisAgent:
 
             submit_use, other_uses = _partition_tool_uses(response.tool_uses)
             if submit_use is not None:
-                return _build_agent_response(model_prediction, submit_use)
+                return _build_agent_response(model_prediction, submit_use, ctx.match_date)
 
             if not other_uses:
                 # The model returned no tool_use and no submit — usually a
@@ -510,24 +503,16 @@ class TennisAgent:
                 f"({tracker.budget.max_web_searches} calls used). "
                 "Call `submit_analysis` next with what you have.",
             )
-        if use.name == FETCH_URL_TOOL_NAME and not tracker.reserve_fetch_url():
-            return _error_block(
-                use,
-                "fetch_url budget exhausted for this prediction "
-                f"({tracker.budget.max_fetch_urls} calls used). "
-                "Call `submit_analysis` next with what you have.",
-            )
 
         try:
             result = await _run_client_tool(self._conn, ctx, use, tracker)
         except (PlayerResolutionError, TavilyError) as exc:
-            # Tavily failed — refund the reservation so a retry could go
-            # through (LLM unlikely to retry the same query, but the budget
-            # accounting stays honest).
+            # Tavily failed — refund the reservation so the budget
+            # counter stays honest (the agent is unlikely to retry the
+            # same query, but the bookkeeping should still match what
+            # actually hit the wire).
             if use.name == WEB_SEARCH_TOOL_NAME:
                 tracker.refund_web_search()
-            elif use.name == FETCH_URL_TOOL_NAME:
-                tracker.refund_fetch_url()
             return _error_block(use, str(exc))
         return {
             "type": "tool_result",
@@ -551,63 +536,53 @@ def _error_block(use: LLMToolUse, message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-# Pydantic input models per tool — used to validate the LLM's JSON before
-# dispatch. Order doesn't matter for cache hashing because the `tools`
-# list (built below) IS what gets hashed.
+# Phase 6.1 tool list — heavily slimmed from Phase 5's six-tool surface.
+# Order matters for cache hashing: the LAST tool gets the `cache_control`
+# marker in `LLMClient`, so `submit_analysis` stays last.
 _CLIENT_TOOL_INPUT_MODELS = {
-    "get_player_stats": GetPlayerStatsInput,
     "get_head_to_head": GetHeadToHeadInput,
-    "get_recent_form": GetRecentFormInput,
-    "get_player_ranking": GetPlayerRankingInput,
+    "get_surface_elo": GetSurfaceEloInput,
     WEB_SEARCH_TOOL_NAME: WebSearchInput,
-    FETCH_URL_TOOL_NAME: FetchUrlInput,
 }
 
 
 def _build_tools_list() -> list[dict[str, Any]]:
-    """Compose the full tool list. Order matters for cache hashing — the
-    LAST tool gets the `cache_control` marker in `LLMClient`, so keep
-    `submit_analysis` last and the rest in a stable order.
+    """Compose the Phase 6.1 tool list.
 
-    Phase 5.1 added Tavily-backed `web_search` and `fetch_url` as
-    client-side tools (replacing Anthropic's server-side native search).
-    They sit between the DB tools and `submit_analysis` so the cache
-    marker still lands on a stable tool definition."""
+    Tools dropped from Phase 5: `get_player_stats`, `get_recent_form`,
+    `get_player_ranking`, `fetch_url`. The first three are now rendered
+    deterministically by the view layer (no LLM in the loop). The
+    fourth is retired because snippet-only news suffices for the bounded
+    32-day window and full-article fetches encouraged over-synthesis.
+
+    `get_model_prediction` is also NOT in this list — `TennisAgent`
+    calls it synchronously before the loop starts (Hard Rule #10).
+    """
     return [
-        {
-            "name": "get_player_stats",
-            "description": (
-                "Career win/loss and per-surface tallies for one player as of "
-                "a given date. Use to anchor surface fit and overall workload."
-            ),
-            "input_schema": _strip_default_keys(GetPlayerStatsInput.model_json_schema()),
-        },
         {
             "name": "get_head_to_head",
             "description": (
-                "Head-to-head record between two players up to a given date. "
-                "Returns aggregate wins plus every recorded meeting (oldest first)."
+                "Detailed head-to-head record between two players. Returns "
+                "per-surface breakdown (Clay / Hard / Grass / IHard wins) "
+                "plus every recorded meeting with date, tournament, round, "
+                "surface, score, completion status, and pre-match odds when "
+                "available. Source is matchstat (live, 24h cached) with "
+                "Sackmann cold-data fallback when quota is exhausted."
             ),
             "input_schema": _strip_default_keys(GetHeadToHeadInput.model_json_schema()),
         },
         {
-            "name": "get_recent_form",
+            "name": "get_surface_elo",
             "description": (
-                "Most recent N matches for one player, newest-first. W/L is from "
-                "the queried player's perspective. Defaults to 10 matches."
+                "Both players' surface-Elo ratings + diff + baseline win "
+                "probability for the queried surface, in a single call. "
+                "Use this once per match; do not call `get_head_to_head` "
+                "or this with `Surface` permutations — pick the surface "
+                "the match is actually played on."
             ),
-            "input_schema": _strip_default_keys(GetRecentFormInput.model_json_schema()),
-        },
-        {
-            "name": "get_player_ranking",
-            "description": (
-                "Singles ranking on or just before a given date. `rank` is null "
-                "when the player was unranked at that date."
-            ),
-            "input_schema": _strip_default_keys(GetPlayerRankingInput.model_json_schema()),
+            "input_schema": _strip_default_keys(GetSurfaceEloInput.model_json_schema()),
         },
         WEB_SEARCH_TOOL,
-        FETCH_URL_TOOL,
         SUBMIT_ANALYSIS_TOOL,
     ]
 
@@ -695,47 +670,92 @@ async def _run_client_tool(
         # retry with the right field names rather than crashing the loop.
         raise PlayerResolutionError(f"invalid arguments for {use.name}: {exc.errors()}") from exc
 
-    if use.name == "get_player_stats":
-        assert isinstance(validated, GetPlayerStatsInput)
-        return get_player_stats(conn, validated).model_dump_json()
     if use.name == "get_head_to_head":
         assert isinstance(validated, GetHeadToHeadInput)
-        return get_head_to_head(conn, validated).model_dump_json()
-    if use.name == "get_recent_form":
-        assert isinstance(validated, GetRecentFormInput)
-        return get_recent_form(conn, validated).model_dump_json()
-    if use.name == "get_player_ranking":
-        assert isinstance(validated, GetPlayerRankingInput)
-        return get_player_ranking(conn, validated).model_dump_json()
+        return get_head_to_head_v2(conn, validated).model_dump_json()
+    if use.name == "get_surface_elo":
+        assert isinstance(validated, GetSurfaceEloInput)
+        return get_surface_elo(conn, validated).model_dump_json()
     if use.name == WEB_SEARCH_TOOL_NAME:
         assert isinstance(validated, WebSearchInput)
         result = await search_web(validated)
         tracker.register_tool_search(result.cost_usd)
         return result.model_dump_json()
-    if use.name == FETCH_URL_TOOL_NAME:
-        assert isinstance(validated, FetchUrlInput)
-        result = await fetch_url(validated)
-        tracker.register_tool_fetch(result.cost_usd)
-        return result.model_dump_json()
     raise AgentError(f"unhandled tool {use.name!r}")  # unreachable
+
+
+_NEWS_WINDOW_DAYS: int = 32
+"""Phase 6.1 news recency window. Items with a parseable `published_date`
+older than this relative to `match_date` are dropped post-validate."""
+
+
+def _parse_iso_date_lenient(raw: str | None) -> date | None:
+    """Best-effort ISO-8601 date parser for Tavily's `published_date`.
+    Returns None for any value we can't confidently parse as a calendar
+    date — those items are KEPT (we don't drop on ambiguity), but cannot
+    be checked against the 32-day window."""
+    if not raw:
+        return None
+    # Try the most-specific forms first, then fall back. Tavily mixes
+    # 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM:SSZ', 'YYYY-MM', and even just 'YYYY'.
+    candidates = [raw[:10], raw[:7] + "-01" if len(raw) >= 7 else None]
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            return date.fromisoformat(cand)
+        except ValueError:
+            continue
+    return None
+
+
+def _filter_news_items(items: list[NewsItem], match_date: date) -> list[NewsItem]:
+    """Apply the two post-validate filters described at the top of
+    `submit.py`: drop `other` category, drop too-old items.
+
+    Items with `published_date=None` are KEPT — the LLM is instructed
+    not to invent dates, and Tavily's date detection is heuristic
+    enough that absence is common even for fresh items.
+    """
+    out: list[NewsItem] = []
+    cutoff = match_date - timedelta(days=_NEWS_WINDOW_DAYS)
+    for item in items:
+        if item.category == "other":
+            continue
+        parsed = _parse_iso_date_lenient(item.published_date)
+        if parsed is not None and parsed < cutoff:
+            continue
+        out.append(item)
+    return out
 
 
 def _build_agent_response(
     prediction: ModelPrediction,
     submit_use: LLMToolUse,
+    match_date: date,
 ) -> AgentResponse:
-    """Merge the LLM's qualitative payload with the model's probability.
-    Pydantic's `extra="forbid"` rejects any LLM-emitted probability field
-    a second time here (the JSON-schema layer is the first wall)."""
+    """Merge the LLM's structured payload with the model's probability.
+    Pydantic's `extra="forbid"` rejects any LLM-emitted probability or
+    prose field a second time here (the JSON-schema layer is the first
+    wall). Then the news-items post-filter drops `other`-tagged items
+    and items older than the 32-day window."""
     merged = {
         **submit_use.input,
         "model_probability_player_a": prediction.model_probability_player_a,
         "model_probability_player_b": prediction.model_probability_player_b,
     }
     try:
-        return AgentResponse.model_validate(merged)
+        candidate = AgentResponse.model_validate(merged)
     except ValidationError as exc:
         raise AgentError(f"submit_analysis returned invalid payload: {exc}") from exc
+
+    filtered = _filter_news_items(list(candidate.news_items), match_date)
+    # If filtering emptied an "ok" status, downgrade to "no_results" so
+    # the UI's empty-state copy matches reality.
+    status = candidate.news_lookup_status
+    if not filtered and status == "ok":
+        status = "no_results"
+    return candidate.model_copy(update={"news_items": filtered, "news_lookup_status": status})
 
 
 __all__ = [

@@ -35,6 +35,7 @@ class FakeMatchstatClient:
         self._calendar: dict[tuple[str, int], list[dict[str, Any]]] = {}
         self._results: dict[tuple[str, int], dict[str, Any]] = {}
         self._fixtures: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._tournament_fixtures: dict[tuple[str, int, int], dict[str, Any]] = {}
         self._rankings: dict[str, list[dict[str, Any]]] = {}
         self._raise_on: str | None = None
 
@@ -55,6 +56,16 @@ class FakeMatchstatClient:
         page_no: int = 1,
     ) -> None:
         self._fixtures[tour, match_date.isoformat(), page_no] = payload
+
+    def set_tournament_fixtures(
+        self,
+        tour: str,
+        tournament_id: int,
+        payload: dict[str, Any],
+        *,
+        page_no: int = 1,
+    ) -> None:
+        self._tournament_fixtures[tour, tournament_id, page_no] = payload
 
     def set_rankings(self, tour: str, items: list[dict[str, Any]]) -> None:
         self._rankings[tour] = items
@@ -94,6 +105,20 @@ class FakeMatchstatClient:
         self.requests_used += 1
         key = (tour, match_date.isoformat(), page_no)
         payload = self._fixtures.get(key, {"data": [], "hasNextPage": False})
+        return FixturesPage.model_validate(payload)
+
+    def fixtures_for_tournament(
+        self,
+        tour: str,
+        tournament_id: int,
+        *,
+        singles_only: bool = True,
+        page_size: int = 200,
+        page_no: int = 1,
+    ) -> FixturesPage:
+        self.requests_used += 1
+        key = (tour, tournament_id, page_no)
+        payload = self._tournament_fixtures.get(key, {"data": [], "hasNextPage": False})
         return FixturesPage.model_validate(payload)
 
     def rankings(
@@ -211,8 +236,10 @@ def test_refresh_hot_happy_path(db: duckdb.DuckDBPyConnection) -> None:
     """
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
+    # Per-date probe is used only to discover active tournament IDs;
+    # the actual fixture data comes from /fixtures/tournament/{id}.
     client.set_fixtures("atp", TODAY, {"data": [_fixture()], "hasNextPage": False})
-    client.set_fixtures("atp", TODAY + timedelta(days=1), {"data": [], "hasNextPage": False})
+    client.set_tournament_fixtures("atp", 21327, {"data": [_fixture()], "hasNextPage": False})
     client.set_rankings("atp", [_ranking()])
 
     summary = refresh_hot(db, client, tours=["ATP"], today=TODAY)
@@ -264,22 +291,60 @@ def test_refresh_hot_does_not_call_tournament_results(
     """
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
+    # Stage a Main-tour fixture so discovery picks up the tournament_id
+    # and triggers a /fixtures/tournament/{id} call.
+    client.set_fixtures("atp", TODAY, {"data": [_fixture()], "hasNextPage": False})
+    client.set_tournament_fixtures("atp", 21327, {"data": [_fixture()], "hasNextPage": False})
     # Deliberately NOT calling set_results.
     refresh_hot(db, client, tours=["ATP"], today=TODAY)
 
-    assert client.requests_used == 4  # 1 calendar + today + tomorrow + rankings
+    # Calendar + discovery (/fixtures/today + /fixtures/tomorrow) +
+    # 1 per-tournament fetch + rankings + Slam-results-cross-check
+    # (which is no-op for ATP 250 since it's not a Grand Slam).
+    # Expect exactly 5: 1 calendar + 2 discovery + 1 per-tournament + 1 rankings.
+    assert client.requests_used == 5
 
 
 def test_refresh_hot_paginates_fixtures(db: duckdb.DuckDBPyConnection) -> None:
-    """fixtures_for_date with hasNextPage=True triggers a follow-up call."""
+    """fixtures_for_tournament with hasNextPage=True triggers a follow-up call."""
     client = FakeMatchstatClient()
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
-    # Two pages: first has 1 fixture and hasNextPage=True, second has 1 fixture and false.
-    client.set_fixtures("atp", TODAY, {"data": [_fixture(fx_id=1)], "hasNextPage": True}, page_no=1)
+    # Discovery just needs to know tournament 21327 is active.
     client.set_fixtures(
-        "atp", TODAY, {"data": [_fixture(fx_id=2)], "hasNextPage": False}, page_no=2
+        "atp",
+        TODAY,
+        {
+            "data": [_fixture(fx_id=1, p1_id=37741, p2_id=87277)],
+            "hasNextPage": False,
+        },
     )
-    client.set_fixtures("atp", TODAY + timedelta(days=1), {"data": [], "hasNextPage": False})
+    # Two per-tournament pages, distinct matchups.
+    client.set_tournament_fixtures(
+        "atp",
+        21327,
+        {
+            "data": [_fixture(fx_id=1, p1_id=37741, p2_id=87277)],
+            "hasNextPage": True,
+        },
+        page_no=1,
+    )
+    client.set_tournament_fixtures(
+        "atp",
+        21327,
+        {
+            "data": [
+                _fixture(
+                    fx_id=2,
+                    p1_id=29935,
+                    p1_name="Tommy Paul",
+                    p2_id=82269,
+                    p2_name="Ethan Quinn",
+                )
+            ],
+            "hasNextPage": False,
+        },
+        page_no=2,
+    )
 
     refresh_hot(db, client, tours=["ATP"], today=TODAY)
 
@@ -439,9 +504,11 @@ def test_refresh_hot_summary_totals_aggregate_across_tours(
     have data, just from the surfaces that ARE driven by the orchestrator.
     """
     client = FakeMatchstatClient()
-    # ATP side: 1 fixture + 1 ranking.
+    # ATP side: 1 fixture + 1 ranking. Discovery probe and per-tournament
+    # fetch both staged so the new refresh flow picks up the fixture.
     client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
     client.set_fixtures("atp", TODAY, {"data": [_fixture()], "hasNextPage": False})
+    client.set_tournament_fixtures("atp", 21327, {"data": [_fixture()], "hasNextPage": False})
     client.set_rankings("atp", [_ranking()])
     # WTA side: empty (no calendar, no fixtures, no rankings).
     summary = refresh_hot(db, client, tours=["ATP", "WTA"], today=TODAY)
@@ -466,3 +533,245 @@ def test_refresh_hot_records_started_and_finished_timestamps(
     started, finished = row
     assert before <= started <= after
     assert started <= finished <= after
+
+
+def test_refresh_hot_per_tournament_pulls_rounds_not_in_today_payload(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Phase 6.2 per-tournament refactor — root motivation. matchstat's
+    `/fixtures/{today}` only lists matches whose Order of Play has been
+    announced for that specific day (Roland Garros typically the evening
+    before). The per-tournament endpoint returns every round matchstat
+    knows about, so R1 fixtures for "two days from now" plus R2 / R3
+    fixtures all land via one tournament-scoped call.
+
+    Regression: prior to this refactor we were missing R1 fixtures
+    whose day-of-play was published after our morning refresh — Norrie
+    -Vallejo on 2026-05-26 at Roland Garros being the live case.
+    """
+    client = FakeMatchstatClient()
+    slam_id = 21329
+    rank_slam = {"id": 4, "name": "Grand Slam"}
+
+    today_match = {
+        "id": 9001,
+        "date": f"{TODAY.isoformat()}T13:00:00.000Z",
+        "roundId": 1,
+        "player1Id": 47275,
+        "player2Id": 47259,
+        "tournamentId": slam_id,
+        "player1": {"id": 47275, "name": "Jannik Sinner"},
+        "player2": {"id": 47259, "name": "Clement Tabur"},
+        "tournament": {"id": slam_id, "name": "French Open - Paris", "rank": rank_slam},
+        "round": {"id": 1, "name": "First"},
+    }
+    # This R1 is NOT in /fixtures/{today} (its day-of-play is announced
+    # later) but IS in /fixtures/tournament/{slam_id}.
+    not_in_today = {
+        "id": 9244,
+        "date": f"{(TODAY + timedelta(days=1)).isoformat()}T14:00:00.000Z",
+        "roundId": 1,
+        "player1Id": 27851,
+        "player2Id": 80391,
+        "tournamentId": slam_id,
+        "player1": {"id": 27851, "name": "Cameron Norrie"},
+        "player2": {"id": 80391, "name": "Adolfo Daniel Vallejo"},
+        "tournament": {"id": slam_id, "name": "French Open - Paris", "rank": rank_slam},
+        "round": {"id": 1, "name": "First"},
+    }
+
+    # Discovery probe — only today's match is here.
+    client.set_fixtures("atp", TODAY, {"data": [today_match], "hasNextPage": False})
+    # Per-tournament endpoint — BOTH rows.
+    client.set_tournament_fixtures(
+        "atp", slam_id, {"data": [today_match, not_in_today], "hasNextPage": False}
+    )
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    names = db.execute(
+        "SELECT player1_name, player2_name FROM scheduled_matches ORDER BY scheduled_match_id"
+    ).fetchall()
+    assert ("Cameron Norrie", "Adolfo Daniel Vallejo") in names
+    assert ("Jannik Sinner", "Clement Tabur") in names
+
+
+def test_refresh_hot_dedupes_same_matchup_under_two_fixture_ids(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """matchstat sometimes returns the same matchup with two different
+    fixture IDs (e.g. one for today, one for tomorrow). Phase 6.2
+    dedupe drops the duplicate."""
+    client = FakeMatchstatClient()
+    client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
+    base = _fixture(
+        fx_id=1294, p1_id=47275, p1_name="Jannik Sinner", p2_id=47259, p2_name="Clement Tabur"
+    )
+    duplicate = {
+        **base,
+        "id": 1295,
+        "date": f"{(TODAY + timedelta(days=1)).isoformat()}T09:00:00.000Z",
+    }
+    # Discovery just needs to know tournament 21327 is active.
+    client.set_fixtures("atp", TODAY, {"data": [base], "hasNextPage": False})
+    # Per-tournament endpoint returns BOTH rows in one payload — matchstat
+    # really does serve duplicate fixture IDs for the same matchup at
+    # times, and the dedupe pass must collapse them.
+    client.set_tournament_fixtures(
+        "atp",
+        21327,
+        {"data": [base, duplicate], "hasNextPage": False},
+    )
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    surviving = db.execute(
+        "SELECT scheduled_match_id FROM scheduled_matches ORDER BY scheduled_match_id"
+    ).fetchall()
+    # The freshest ingested_at wins (Phase 6.2 dedupe contract — matchstat's
+    # latest publishing supersedes the older fixture_id). 1295 is processed
+    # after 1294 in the iteration order so it wins on the ingested_at +
+    # fx_id tiebreak.
+    assert surviving == [("matchstat::1295",)]
+
+
+def test_refresh_hot_prunes_completed_slam_via_tournament_results(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """For active Slam tournaments, the refresh fetches
+    `/tournament/results/` and deletes any scheduled_matches row whose
+    matchup matchstat lists as completed. Catches the leaked-completed-
+    fixture case where no later-round row exists yet (Duckworth-Diallo
+    at Roland Garros 2026)."""
+    client = FakeMatchstatClient()
+    slam_id = 21329
+    client.set_calendar(
+        "atp",
+        TODAY.year,
+        [
+            {
+                "id": slam_id,
+                "name": "French Open - Paris",
+                "tier": "Grand Slam",
+                "date": f"{TODAY.isoformat()}T00:00:00.000Z",
+                "court": {"id": 2, "name": "Clay"},
+                "rank": {"id": 1, "name": "Main tour"},
+                "countryAcr": "FRA",
+            }
+        ],
+    )
+    leaked = {
+        "id": 1215,
+        "date": f"{(TODAY + timedelta(days=1)).isoformat()}T09:00:00.000Z",
+        "roundId": 1,
+        "player1Id": 11517,
+        "player2Id": 68627,
+        "tournamentId": slam_id,
+        "player1": {"id": 11517, "name": "James Duckworth", "countryAcr": "AUS"},
+        "player2": {"id": 68627, "name": "Gabriel Diallo", "countryAcr": "CAN"},
+        "tournament": {
+            "id": slam_id,
+            "name": "French Open - Paris",
+            "court": {"name": "Clay"},
+            # rank.name = "Grand Slam" is required for the discovery step
+            # to pick up this tournament_id and trigger the per-tournament
+            # fetch + the Slam-results cross-check.
+            "rank": {"id": 4, "name": "Grand Slam"},
+        },
+        "round": {"id": 1, "name": "First"},
+    }
+    # Discovery probe (tomorrow only — today is empty for this test).
+    client.set_fixtures("atp", TODAY + timedelta(days=1), {"data": [leaked], "hasNextPage": False})
+    # Per-tournament fetch returns the leaked row.
+    client.set_tournament_fixtures("atp", slam_id, {"data": [leaked], "hasNextPage": False})
+    # tournament_results reports the match as completed
+    client.set_results(
+        "atp",
+        slam_id,
+        {
+            "data": {
+                "singles": [
+                    {
+                        "id": "99999999",
+                        "player1Id": 11517,
+                        "player2Id": 68627,
+                        "tournamentId": slam_id,
+                        "player1": {"id": 11517, "name": "James Duckworth"},
+                        "player2": {"id": 68627, "name": "Gabriel Diallo"},
+                        "result": "6-3 6-4 6-2",
+                        "match_winner": 2,
+                    }
+                ]
+            }
+        },
+    )
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    surviving = db.execute("SELECT COUNT(*) FROM scheduled_matches").fetchone()
+    assert surviving == (0,)
+
+
+def test_refresh_hot_prunes_round_contradicted_fixture(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Phase 6.2 guard: matchstat occasionally returns a completed R1
+    fixture in `/fixtures/{date}` even after a corresponding R2 has been
+    published. If player X is in both an R1 and an R2 row at the same
+    tournament, the R1 row must be stale (X can't advance to R2 without
+    finishing R1 first).
+
+    Bonzi-Zverev / Machac-Zverev at Roland Garros 2026 was the live
+    case that motivated this prune.
+    """
+    client = FakeMatchstatClient()
+    client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
+
+    tour_rank = {"id": 2, "name": "Main tour"}
+    # R1 (stale): Bonzi vs Zverev on TODAY
+    r1_stale = {
+        "id": 1247,
+        "date": f"{TODAY.isoformat()}T13:00:00.000Z",
+        "roundId": 1,
+        "player1Id": 28899,
+        "player2Id": 24008,
+        "tournamentId": 21327,
+        "player1": {"id": 28899, "name": "Benjamin Bonzi", "countryAcr": "FRA"},
+        "player2": {"id": 24008, "name": "Alexander Zverev", "countryAcr": "GER"},
+        "tournament": {
+            "id": 21327,
+            "name": "Geneva Open",
+            "court": {"name": "Clay"},
+            "rank": tour_rank,
+        },
+        "round": {"id": 1, "name": "First"},
+    }
+    # R2: Machac vs Zverev tomorrow — Zverev appears in BOTH rows.
+    r2 = {
+        "id": 1313,
+        "date": f"{(TODAY + timedelta(days=1)).isoformat()}T13:00:00.000Z",
+        "roundId": 2,
+        "player1Id": 12345,
+        "player2Id": 24008,
+        "tournamentId": 21327,
+        "player1": {"id": 12345, "name": "Tomas Machac", "countryAcr": "CZE"},
+        "player2": {"id": 24008, "name": "Alexander Zverev", "countryAcr": "GER"},
+        "tournament": {
+            "id": 21327,
+            "name": "Geneva Open",
+            "court": {"name": "Clay"},
+            "rank": tour_rank,
+        },
+        "round": {"id": 2, "name": "Second"},
+    }
+    # Discovery probe surfaces the tournament_id from today's payload.
+    client.set_fixtures("atp", TODAY, {"data": [r1_stale], "hasNextPage": False})
+    # Per-tournament endpoint returns BOTH R1 and R2 in one payload.
+    client.set_tournament_fixtures("atp", 21327, {"data": [r1_stale, r2], "hasNextPage": False})
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    surviving = db.execute(
+        "SELECT scheduled_match_id, round_name FROM scheduled_matches ORDER BY scheduled_match_id"
+    ).fetchall()
+    assert surviving == [("matchstat::1313", "Second")]

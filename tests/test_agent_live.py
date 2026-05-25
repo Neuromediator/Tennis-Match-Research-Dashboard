@@ -146,9 +146,9 @@ async def test_live_agent_returns_valid_response(seeded_db, monkeypatch) -> None
     monkeypatch.setattr(agent_module, "get_model_prediction", lambda *a, **k: _stub_prediction())
     agent = TennisAgent(seeded_db)
     response = await agent.predict(_ctx())
-    assert response.confidence_band in ("low", "medium", "high")
+    # Phase 6.1 schema: news_lookup_status + news_items, no narrative.
+    assert response.news_lookup_status in ("ok", "no_results", "failed")
     assert response.model_probability_player_a == pytest.approx(0.58)
-    assert response.key_factors  # at least one factor
 
     # Phase 5.1 cost sanity ceiling. The pre-implementation projection of
     # $0.025/predict assumed a 2-turn agent loop; in practice Sonnet

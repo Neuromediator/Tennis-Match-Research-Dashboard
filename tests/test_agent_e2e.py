@@ -1,19 +1,23 @@
 """Tier-2 e2e tests for the LLM agent.
 
-Each test loads a recorded fixture under `tests/fixtures/llm/` describing
-one or more canned Anthropic responses, replays them through a stub
-client, and asserts the agent loop:
+Phase 6.1 status: the Phase 5 fixtures in `tests/fixtures/llm/*.json`
+reference the retired `narrative` / `confidence_band` / `caveats` /
+`key_factors` schema and the retired `get_player_stats` /
+`get_recent_form` / `get_player_ranking` / `fetch_url` tool surface.
+Re-recording them requires a live API run (Phase 6.1 task #34) which
+is the user's responsibility (paid).
 
-- assembles a valid `AgentResponse` with the model's probability merged
-  in (LLM never emits a probability — Hard Rule #4);
-- handles the degraded `web_search` case without aborting;
-- recovers cleanly when a DB tool returns empty data (failure-mode 2).
-
-`get_model_prediction` is patched out — the model artifact is loaded in
-the live tier instead, and these fixtures should pass on a CI machine
-that has no model files on disk.
+Until the fresh fixtures land, this whole module is skipped to keep
+the unit-test tier green. The new agent surface IS covered by
+hand-crafted unit tests in `tests/test_agent_loop_phase_6_1.py`.
 """
 
+# pyright: reportAttributeAccessIssue=false
+# Phase 6.1 retired the AgentResponse fields this file's assertions still
+# read (`narrative`, `confidence_band`, `caveats`, `key_factors`). The
+# whole module is `pytest.mark.skip`'d at the bottom pending fixture
+# re-record (task #34); this directive prevents pyright from blocking
+# the gate on dead-but-still-present assertions.
 from __future__ import annotations
 
 import json
@@ -38,6 +42,14 @@ from tennis_predictor.llm.tools.schemas import (
     ModelPrediction,
 )
 from tennis_predictor.llm.tools.web_search import TAVILY_SEARCH_URL
+
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Phase 5 fixtures reference retired AgentResponse fields "
+        "(narrative / confidence_band / caveats / key_factors) and the "
+        "retired tool surface. Re-record under Phase 6.1 task #34."
+    )
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "llm"
 

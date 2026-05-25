@@ -109,12 +109,23 @@ def _load_predictor(model_path: Path) -> CalibratedPredictor:
 
 def _feature_vector_to_frame(fv: FeatureVector) -> pd.DataFrame:
     """Build the single-row DataFrame the predictor expects, in the
-    canonical FEATURE_COLUMNS order with categoricals typed."""
+    canonical FEATURE_COLUMNS order with categoricals typed.
+
+    Numeric columns are forced to float: when a single-row DataFrame
+    contains `None` in an int-like field (e.g. `h2h_recency_days=None`
+    for never-met pairs), pandas falls back to `object` dtype, which
+    LightGBM rejects with "pandas dtypes must be int, float or bool".
+    Training reads via DuckDB which already yields proper NaN-bearing
+    floats; inference has to recreate that dtype profile explicitly.
+    """
     record = fv.model_dump()
     row = {col: record[col] for col in FEATURE_COLUMNS}
     df = pd.DataFrame([row], columns=list(FEATURE_COLUMNS))
-    for col in CATEGORICAL_COLUMNS:
-        df[col] = pd.Categorical(df[col], categories=CATEGORY_VALUES[col])
+    for col in FEATURE_COLUMNS:
+        if col in CATEGORICAL_COLUMNS:
+            df[col] = pd.Categorical(df[col], categories=CATEGORY_VALUES[col])
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
