@@ -62,6 +62,21 @@ def test_fixture_match_key_is_order_independent() -> None:
     assert k1 == k2
 
 
+def test_fixture_match_key_treats_hyphen_as_space() -> None:
+    """Live observation: matchstat returns 'Felix Auger Aliassime' (no
+    hyphen) while The Odds API returns 'Felix Auger-Aliassime' (hyphen).
+    Similarly Pablo Carreno-Busta vs Pablo Carreno Busta. The key must
+    collapse the hyphen so both providers land on the same row."""
+    when = datetime(2026, 5, 26, 18, 0, tzinfo=UTC)
+    matchstat_key = fixture_match_key("ATP", "Felix Auger Aliassime", "Daniel Altmaier", when)
+    odds_key = fixture_match_key("ATP", "Felix Auger-Aliassime", "Daniel Altmaier", when)
+    assert matchstat_key == odds_key
+    # And the reverse case (matchstat hyphenated, odds not).
+    ms_key2 = fixture_match_key("ATP", "Thanasi Kokkinakis", "Pablo Carreno-Busta", when)
+    odds_key2 = fixture_match_key("ATP", "Thanasi Kokkinakis", "Pablo Carreno Busta", when)
+    assert ms_key2 == odds_key2
+
+
 def test_fixture_match_key_distinguishes_dates_and_tours() -> None:
     when = datetime(2026, 5, 26, 18, 0, tzinfo=UTC)
     later = datetime(2026, 5, 27, 18, 0, tzinfo=UTC)

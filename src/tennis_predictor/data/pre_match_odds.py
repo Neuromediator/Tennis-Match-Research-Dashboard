@@ -42,9 +42,17 @@ FRESHNESS_TTL: timedelta = timedelta(hours=24)
 
 def _normalise_name(name: str) -> str:
     """Lowercase, strip whitespace, collapse internal spaces, drop
-    diacritics-style punctuation. Conservative: the canonical-name
-    contract is strong enough that we don't try fancy fuzzy matching."""
+    hyphens — providers disagree on hyphenation of compound surnames.
+
+    Live case: matchstat returns "Felix Auger Aliassime" (no hyphen),
+    The Odds API returns "Felix Auger-Aliassime" (hyphenated). Without
+    normalising the hyphen, the fixture_match_key derived on each side
+    differs and the join fails. Same risk for Pierre-Hugues Herbert,
+    Jan-Lennard Struff, etc., though those are consistently hyphenated
+    in both sources today. Conservative: only the hyphen is collapsed
+    — we don't strip diacritics or any other punctuation."""
     text = name.strip().lower()
+    text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text)
     return text
 
