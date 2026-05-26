@@ -42,16 +42,33 @@ def _synthetic_features(
     elo_p1: float,
     elo_p2: float,
 ) -> dict[str, object]:
-    """Phase 4.1 v2 synthetic features. Returns all 39 FeatureVector fields
+    """Phase 4.2 v3 synthetic features. Returns all 41 FeatureVector fields
     with realistic, in-bounds random values. The metadata block mirrors what
     `compute_features` would emit after JOINing `players` — heights and
-    days_since_last_match occasionally None to exercise the NaN paths."""
+    days_since_last_match occasionally None to exercise the NaN paths.
+
+    Phase 4.2 added surface-specific recovery (2 fields). To keep the
+    synthetic distribution structurally honest, the surface-specific gap
+    is sampled to be >= the global gap whenever both are present (a player
+    can't have last played a surface more recently than they last played
+    anything at all).
+    """
     height_p1 = int(rng.integers(165, 205)) if rng.random() < 0.7 else None
     height_p2 = int(rng.integers(165, 205)) if rng.random() < 0.7 else None
     age_p1 = float(rng.uniform(18.0, 36.0))
     age_p2 = float(rng.uniform(18.0, 36.0))
     days_p1 = int(rng.integers(2, 60)) if rng.random() < 0.9 else None
     days_p2 = int(rng.integers(2, 60)) if rng.random() < 0.9 else None
+    days_surf_p1 = (
+        int(rng.integers(days_p1, min(days_p1 + 300, 365) + 1))
+        if days_p1 is not None and rng.random() < 0.9
+        else None
+    )
+    days_surf_p2 = (
+        int(rng.integers(days_p2, min(days_p2 + 300, 365) + 1))
+        if days_p2 is not None and rng.random() < 0.9
+        else None
+    )
     return {
         "elo_p1_surface": elo_p1,
         "elo_p2_surface": elo_p2,
@@ -93,6 +110,8 @@ def _synthetic_features(
         "height_diff_cm": (height_p1 - height_p2) if (height_p1 and height_p2) else None,
         "days_since_last_match_p1": days_p1,
         "days_since_last_match_p2": days_p2,
+        "days_since_last_match_surface_p1": days_surf_p1,
+        "days_since_last_match_surface_p2": days_surf_p2,
     }
 
 
@@ -181,7 +200,7 @@ def _build_synthetic_db(db_path: Path) -> None:
                     "p2_player_id": p2,
                     "label_winner_is_p1": label,
                     **feats,
-                    "schema_version": 2,
+                    "schema_version": 3,
                 }
             )
             # Market odds for ~80% of matches.
@@ -283,7 +302,7 @@ def test_train_models_cli_end_to_end(smoke_env: tuple[Path, Path]) -> None:
         assert meta["tour"] == "ATP"
         assert meta["model_type"] == model_type
         assert meta["walk_forward"]["n_folds"] == len(VALIDATE_YEARS)
-        assert len(meta["features"]) == 39
+        assert len(meta["features"]) == 41
         assert meta["calibration_method"] in ("isotonic", "platt")
 
         # Round-trip: model.joblib + fixture.

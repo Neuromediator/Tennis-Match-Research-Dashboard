@@ -16,8 +16,17 @@ The 11 new fields are:
   (capped at 365 days — beyond that the feature is "returning from a long
   absence", not "recovery", per the Phase 4.1 design doc).
 
+**v3 (Phase 4.2) — 41 fields**: v2 + surface-specific recovery (2):
+
+- `days_since_last_match_surface_p1`, `days_since_last_match_surface_p2`
+  — gap since the player's most recent completed match ON THIS SURFACE,
+  capped at 365 days. None on cold start (no prior match on this
+  surface). Lets LightGBM learn the "stale surface-Elo" pattern from
+  data instead of restructuring Elo itself. See
+  `docs/tutorials/phase_4_2_notes.md`.
+
 Per-field rationale lives in `.claude/skills/feature-engineering/SKILL.md`
-and `docs/tutorials/phase_4_1_notes.md`.
+and `docs/tutorials/phase_4_1_notes.md` / `phase_4_2_notes.md`.
 
 Canonical pair ordering: `p1` is the lex-smaller `player_id`. Callers of
 `compute_features` may pass players in any order; the function normalizes
@@ -43,7 +52,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 3
 """FeatureVector schema generation. Bumped whenever the field set or
 contract changes — used by the `training_features` DDL migration and by
 `metadata.json` in trained-model artifacts.
@@ -51,6 +60,7 @@ contract changes — used by the `training_features` DDL migration and by
 History:
 - v1 (Phase 3): 28 fields, no player metadata, no recovery signal.
 - v2 (Phase 4.1): 39 fields = v1 + 9 player-metadata + 2 recovery.
+- v3 (Phase 4.2): 41 fields = v2 + 2 surface-specific recovery.
 """
 
 TournamentLevel = Literal[
@@ -76,7 +86,7 @@ Hand = Literal["R", "L", "A", "U"]
 
 
 class FeatureVector(BaseModel):
-    """v2 FeatureVector — 39 fields for one (p1, p2, surface, as_of_date) instance."""
+    """v3 FeatureVector — 41 fields for one (p1, p2, surface, as_of_date) instance."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -150,6 +160,14 @@ class FeatureVector(BaseModel):
     # from "recovery" to "returning from long absence" — different effect).
     days_since_last_match_p1: int | None = Field(default=None, ge=0, le=365)
     days_since_last_match_p2: int | None = Field(default=None, ge=0, le=365)
+
+    # --- Phase 4.2: surface-specific recovery (2) ---
+    # None when the player has no prior completed match ON THIS SURFACE
+    # (cold start). Same 365-day cap and semantic flip as the global
+    # recovery features. Surface normalisation matches the existing
+    # taxonomy (Hard / IHard / Clay / Grass; Carpet→IHard).
+    days_since_last_match_surface_p1: int | None = Field(default=None, ge=0, le=365)
+    days_since_last_match_surface_p2: int | None = Field(default=None, ge=0, le=365)
 
 
 FEATURE_FIELD_NAMES: tuple[str, ...] = tuple(FeatureVector.model_fields.keys())

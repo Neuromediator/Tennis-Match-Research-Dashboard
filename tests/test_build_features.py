@@ -435,6 +435,98 @@ def test_elo_state_persisted(fresh_db: duckdb.DuckDBPyConnection) -> None:
     assert by_player["ATP_B"] < 1500.0
 
 
+def test_v3_sentinel_columns_present(fresh_db: duckdb.DuckDBPyConnection) -> None:
+    """Phase 4.2 v3 smoke: after build, the two surface-specific recovery
+    columns must exist on training_features and be populated for the
+    label-eligible row."""
+    _reset_counter()
+    _seed_history(fresh_db, "ATP_A", [f"ATP_OP_{i}" for i in range(5)], date(2020, 1, 1))
+    _seed_history(fresh_db, "ATP_B", [f"ATP_OQ_{i}" for i in range(5)], date(2020, 2, 1))
+    _insert_match(
+        fresh_db,
+        winner="ATP_A",
+        loser="ATP_B",
+        match_date=date(2020, 3, 1),
+        match_num=1,
+    )
+    build_training_features(fresh_db)
+    row = fresh_db.execute(
+        "SELECT days_since_last_match_surface_p1, days_since_last_match_surface_p2 "
+        "FROM training_features"
+    ).fetchone()
+    assert row is not None
+    p1_gap, p2_gap = row
+    # Both seeded their history on Hard; the target match is also Hard.
+    # Each player's most recent Hard match is the LAST of their 5 warm-ups.
+    # ATP_A: warm-ups 2020-01-01..05; gap to 2020-03-01 is 56 days (leap year).
+    # ATP_B: warm-ups 2020-02-01..05; gap to 2020-03-01 is 25 days.
+    assert p1_gap == (date(2020, 3, 1) - date(2020, 1, 5)).days
+    assert p2_gap == (date(2020, 3, 1) - date(2020, 2, 5)).days
+
+
+def test_v3_surface_recovery_independent_of_other_surface_history(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """The Phase 4.2 invariant: a player's recent Clay history must NOT
+    reset their Hard surface-gap. This is the whole point of the feature."""
+    _reset_counter()
+    # ATP_A warmup history split: 5 Clay matches earlier, then 1 Hard match later.
+    _seed_history(
+        fresh_db,
+        "ATP_A",
+        [f"ATP_OP_{i}" for i in range(5)],
+        date(2020, 1, 1),
+        surface="Clay",
+        tourney_name="Warm-up Clay",
+    )
+    _insert_match(
+        fresh_db,
+        winner="ATP_A",
+        loser="ATP_HARD_OPP",
+        match_date=date(2020, 1, 10),
+        surface="Hard",
+        tourney_name="Warm-up Hard",
+        match_num=190,
+    )
+    # ATP_B warmup history on Clay.
+    _seed_history(
+        fresh_db,
+        "ATP_B",
+        [f"ATP_OQ_{i}" for i in range(5)],
+        date(2020, 4, 1),
+        surface="Clay",
+        tourney_name="Warm-up Clay",
+    )
+    # Bring ATP_A above the history floor on Clay (5 warm-ups + 1 Hard = 6, OK).
+    # Target match on Clay between A and B, late June.
+    _insert_match(
+        fresh_db,
+        winner="ATP_A",
+        loser="ATP_B",
+        match_date=date(2020, 6, 1),
+        surface="Clay",
+        tourney_name="Target Clay Open",
+        match_num=999,
+    )
+    build_training_features(fresh_db)
+    # ATP_A < ATP_B lexicographically.
+    row = fresh_db.execute(
+        "SELECT days_since_last_match_p1, days_since_last_match_surface_p1 "
+        "FROM training_features WHERE match_id LIKE '%FIX-%' "
+        "ORDER BY match_date DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    global_gap, surface_gap = row
+    # Global gap: most recent ATP_A match was 2020-01-10 (Hard).
+    # Gap to 2020-06-01 = 143 days.
+    assert global_gap == 143
+    # Surface (Clay) gap: most recent ATP_A Clay match was 2020-01-05.
+    # Gap to 2020-06-01 = 148 days — strictly greater than global, since
+    # A played Hard more recently.
+    assert surface_gap == 148
+    assert surface_gap > global_gap
+
+
 def test_ranking_sentinel_for_unranked_player(fresh_db: duckdb.DuckDBPyConnection) -> None:
     _reset_counter()
     _seed_history(fresh_db, "ATP_A", [f"ATP_OP_{i}" for i in range(5)], date(2020, 1, 1))

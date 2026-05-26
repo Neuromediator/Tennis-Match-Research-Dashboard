@@ -51,13 +51,14 @@ from tennis_predictor.features.schema import FEATURE_FIELD_NAMES
 
 
 @pytest.mark.leakage
-def test_feature_vector_has_exactly_39_fields() -> None:
+def test_feature_vector_has_exactly_41_fields() -> None:
     """Guards against silent additions/removals diverging from
     `.claude/skills/feature-engineering/SKILL.md` and `docs/phases.md`.
-    Phase 4.1 bumped v1's 28 fields to v2's 39 (v1 + 11 metadata/recovery).
+    Phase 4.1 bumped v1's 28 to v2's 39; Phase 4.2 added 2 surface-recovery
+    fields, bringing v3 to 41.
     """
-    assert len(FeatureVector.model_fields) == 39, (
-        f"FeatureVector must have 39 fields (Phase 4.1 v2 — see feature-engineering skill); "
+    assert len(FeatureVector.model_fields) == 41, (
+        f"FeatureVector must have 41 fields (Phase 4.2 v3 — see feature-engineering skill); "
         f"got {len(FeatureVector.model_fields)}"
     )
 
@@ -81,7 +82,9 @@ def test_feature_vector_family_breakdown() -> None:
         "handedness": 2,
         "age": 4,
         "height": 3,
-        "recovery": 2,
+        # Phase 4.2: recovery family expanded from 2 → 4 with the
+        # surface-specific pair `days_since_last_match_surface_p1/p2`.
+        "recovery": 4,
     }
 
     def classify(name: str) -> str:
@@ -374,6 +377,13 @@ def test_baseline_has_nontrivial_values(leakage_db: duckdb.DuckDBPyConnection) -
     # (matches insertion order); P2's was 2020-04-23.
     assert fv.days_since_last_match_p1 == (TARGET_DATE - date(2020, 4, 25)).days
     assert fv.days_since_last_match_p2 == (TARGET_DATE - date(2020, 4, 23)).days
+    # Phase 4.2: surface-specific recovery. The target match's surface is
+    # Hard. P1's most recent Hard match in the fixture is 2020-04-25
+    # (warm-up Hard win over P3); P2's most recent Hard match is
+    # 2020-04-23 (defaulted Hard, won over P4). P2's earlier 8 warm-ups
+    # were on Clay and don't count for surface=Hard.
+    assert fv.days_since_last_match_surface_p1 == (TARGET_DATE - date(2020, 4, 25)).days
+    assert fv.days_since_last_match_surface_p2 == (TARGET_DATE - date(2020, 4, 23)).days
 
 
 @pytest.mark.leakage
@@ -572,6 +582,51 @@ def test_inserting_future_player_match_does_not_shrink_days_since(
     after = _baseline_fv(leakage_db)
     assert before.days_since_last_match_p1 == after.days_since_last_match_p1
     assert before.days_since_last_match_p2 == after.days_since_last_match_p2
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.2 — LastMatchPerSurfaceState leakage tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.leakage
+def test_inserting_future_surface_match_does_not_shrink_surface_days_since(
+    leakage_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Inserting a brand-new future Hard match for P1 must NOT shorten
+    `days_since_last_match_surface_p1`. The surface-specific recovery
+    feature must remain pinned to the most recent PAST Hard match
+    (2020-04-25), independent of anything after TARGET_DATE."""
+    before = _baseline_fv(leakage_db)
+    _insert_match(
+        leakage_db,
+        winner=P1,
+        loser=P3,
+        match_date=date(2020, 5, 8),  # would be 7 days before TARGET if it leaked
+        surface="Hard",
+        match_num=991,
+    )
+    after = _baseline_fv(leakage_db)
+    assert before.days_since_last_match_surface_p1 == after.days_since_last_match_surface_p1
+    assert before.days_since_last_match_surface_p2 == after.days_since_last_match_surface_p2
+
+
+@pytest.mark.leakage
+def test_swapping_future_match_surface_does_not_change_surface_days_since(
+    leakage_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Mutating a future match's surface (Hard → Clay) must not perturb the
+    surface-specific recovery feature for an earlier as_of_date — the
+    feature only reads PAST matches and is sliced by surface, so a future
+    surface flip is doubly inert."""
+    before = _baseline_fv(leakage_db)
+    leakage_db.execute(
+        "UPDATE matches SET surface = ? WHERE match_num = ?",
+        ["Clay", 500],
+    )
+    after = _baseline_fv(leakage_db)
+    assert before.days_since_last_match_surface_p1 == after.days_since_last_match_surface_p1
+    assert before.days_since_last_match_surface_p2 == after.days_since_last_match_surface_p2
 
 
 # ---------------------------------------------------------------------------

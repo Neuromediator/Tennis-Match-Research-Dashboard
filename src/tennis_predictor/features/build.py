@@ -60,6 +60,7 @@ from tennis_predictor.features.elo import EloState
 from tennis_predictor.features.fatigue import FatigueState, count_sets
 from tennis_predictor.features.h2h import H2HState
 from tennis_predictor.features.last_match import LastMatchState
+from tennis_predictor.features.last_match_surface import LastMatchPerSurfaceState
 from tennis_predictor.features.player_metadata import (
     PlayerMetadataLookup,
     compute_age,
@@ -153,6 +154,9 @@ _TRAINING_FEATURES_COLUMNS: tuple[str, ...] = (
     "height_diff_cm",
     "days_since_last_match_p1",
     "days_since_last_match_p2",
+    # Phase 4.2 v3 columns
+    "days_since_last_match_surface_p1",
+    "days_since_last_match_surface_p2",
 )
 
 _INSERT_SQL = (
@@ -231,6 +235,7 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
     fatigue = FatigueState()
     serve_return = ServeReturnState()
     last_match = LastMatchState()
+    last_match_surface = LastMatchPerSurfaceState()
     summary = BuildSummary()
 
     conn.execute("BEGIN TRANSACTION")
@@ -302,6 +307,7 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
                     fatigue=fatigue,
                     serve_return=serve_return,
                     last_match=last_match,
+                    last_match_surface=last_match_surface,
                     ranking_lookup=ranking_lookup,
                     player_metadata=player_metadata,
                 )
@@ -321,6 +327,8 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
             serve_return.update(m.winner_id, m.loser_id, surface, m.match_date, m.stats)
             last_match.update(m.winner_id, m.match_date)
             last_match.update(m.loser_id, m.match_date)
+            last_match_surface.update(m.winner_id, surface, m.match_date)
+            last_match_surface.update(m.loser_id, surface, m.match_date)
             summary.state_updates_applied += 1
 
         if batch:
@@ -332,6 +340,7 @@ def build_training_features(conn: duckdb.DuckDBPyConnection) -> BuildSummary:
 
     elo.save_to_db(conn)
     last_match.save_to_db(conn)
+    last_match_surface.save_to_db(conn)
 
     logger.info(
         "build_training_features done: scanned=%d, updates=%d, training_rows=%d, "
@@ -468,6 +477,7 @@ def _build_feature_vector(
     fatigue: FatigueState,
     serve_return: ServeReturnState,
     last_match: LastMatchState,
+    last_match_surface: LastMatchPerSurfaceState,
     ranking_lookup: RankingLookup,
     player_metadata: PlayerMetadataLookup,
 ) -> FeatureVector:
@@ -501,6 +511,8 @@ def _build_feature_vector(
 
     days_since_p1 = last_match.days_since(p1, match_date)
     days_since_p2 = last_match.days_since(p2, match_date)
+    days_since_p1_surface = last_match_surface.days_since(p1, surface, match_date)
+    days_since_p2_surface = last_match_surface.days_since(p2, surface, match_date)
 
     return FeatureVector.model_validate(
         {
@@ -543,6 +555,8 @@ def _build_feature_vector(
             "height_diff_cm": compute_height_diff(meta_p1.height, meta_p2.height),
             "days_since_last_match_p1": days_since_p1,
             "days_since_last_match_p2": days_since_p2,
+            "days_since_last_match_surface_p1": days_since_p1_surface,
+            "days_since_last_match_surface_p2": days_since_p2_surface,
         }
     )
 
@@ -603,4 +617,6 @@ def _to_insert_row(
         fv.height_diff_cm,
         fv.days_since_last_match_p1,
         fv.days_since_last_match_p2,
+        fv.days_since_last_match_surface_p1,
+        fv.days_since_last_match_surface_p2,
     )

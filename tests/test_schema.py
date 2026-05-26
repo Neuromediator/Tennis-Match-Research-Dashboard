@@ -130,10 +130,10 @@ def test_scheduled_matches_rejects_duplicate_external_id(
         fresh_db.execute(base_sql, ["matchstat::1215-dup"])
 
 
-def test_training_features_has_phase4_1_layout(
+def test_training_features_has_phase4_2_layout(
     fresh_db: duckdb.DuckDBPyConnection,
 ) -> None:
-    """Phase 4.1 v2 schema must include every FeatureVector field plus identifiers."""
+    """Phase 4.2 v3 schema must include every FeatureVector field plus identifiers."""
     schema.create_all_tables(fresh_db)
     cols = {
         row[0]
@@ -200,6 +200,9 @@ def test_training_features_has_phase4_1_layout(
         # Phase 4.1 — recovery (2)
         "days_since_last_match_p1",
         "days_since_last_match_p2",
+        # Phase 4.2 — surface-specific recovery (2)
+        "days_since_last_match_surface_p1",
+        "days_since_last_match_surface_p2",
         # bookkeeping
         "schema_version",
     }
@@ -232,9 +235,9 @@ def test_training_features_migration_drops_v1_phase3_shape(
     fresh_db: duckdb.DuckDBPyConnection,
 ) -> None:
     """If the Phase 3 (v1) shape exists — has `tournament_level` but is missing
-    the Phase 4.1 columns — create_all_tables must drop it so the v2 DDL
-    can take its place. We always re-run `scripts/build_features.py` after
-    a feature-set change."""
+    the Phase 4.2 sentinel column — create_all_tables must drop it so the v3
+    DDL can take its place. We always re-run `scripts/build_features.py`
+    after a feature-set change."""
     fresh_db.execute(
         """
         CREATE TABLE training_features (
@@ -257,8 +260,42 @@ def test_training_features_migration_drops_v1_phase3_shape(
             "WHERE table_name = 'training_features'"
         ).fetchall()
     }
-    assert "days_since_last_match_p1" in cols, (
-        "v1→v2 migration did not run; Phase 3 shape still present"
+    assert "days_since_last_match_surface_p1" in cols, (
+        "v1→v3 migration did not run; Phase 3 shape still present"
+    )
+
+
+def test_training_features_migration_drops_v2_phase4_1_shape(
+    fresh_db: duckdb.DuckDBPyConnection,
+) -> None:
+    """If the Phase 4.1 (v2) shape exists — has `days_since_last_match_p1`
+    but is missing the Phase 4.2 surface-recovery columns — create_all_tables
+    must drop it so the v3 DDL can take its place."""
+    fresh_db.execute(
+        """
+        CREATE TABLE training_features (
+            match_id VARCHAR PRIMARY KEY,
+            tour VARCHAR NOT NULL,
+            match_date DATE NOT NULL,
+            p1_player_id VARCHAR NOT NULL,
+            p2_player_id VARCHAR NOT NULL,
+            label_winner_is_p1 INTEGER NOT NULL,
+            tournament_level VARCHAR NOT NULL,
+            days_since_last_match_p1 INTEGER,
+            schema_version INTEGER NOT NULL DEFAULT 2
+        )
+        """
+    )
+    schema.create_all_tables(fresh_db)
+    cols = {
+        row[0]
+        for row in fresh_db.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'training_features'"
+        ).fetchall()
+    }
+    assert "days_since_last_match_surface_p1" in cols, (
+        "v2→v3 migration did not run; Phase 4.1 shape still present"
     )
 
 

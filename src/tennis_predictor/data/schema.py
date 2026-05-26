@@ -178,6 +178,23 @@ CREATE TABLE IF NOT EXISTS last_match_state (
 );
 """
 
+# Phase 4.2: surface-specific extension of `last_match_state`. One row per
+# `(player_id, surface)` pair. Lets the model see a stale-surface signal
+# even when the player has been competing on a different surface — the
+# Phase 6.2 close-out cases (Djokovic clay 2026, Opelka comeback hard,
+# Kasatkina spring-clay returns) that the global recovery signal averaged
+# out. Persisted by `LastMatchPerSurfaceState` at the end of
+# `build_training_features`; inference loads + rolls forward, same as Elo
+# and `last_match_state`. See `features/last_match_surface.py`.
+LAST_MATCH_PER_SURFACE_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS last_match_per_surface_state (
+    player_id        VARCHAR NOT NULL,
+    surface          VARCHAR NOT NULL,
+    last_match_date  DATE NOT NULL,
+    PRIMARY KEY (player_id, surface)
+);
+"""
+
 # Upcoming fixtures pulled from the hot API. One row per fixture the API
 # currently exposes (round-by-round visibility — see docs/phases.md Phase 2).
 # Rows are removed (or matched out) once the corresponding `matches` row
@@ -357,13 +374,14 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
 );
 """
 
-# Phase 4.1: full FeatureVector layout — v2, 39 features. See
+# Phase 4.1 + 4.2: full FeatureVector layout — v3, 41 features. See
 # `src/tennis_predictor/features/schema.py` for the Pydantic contract.
 # Required columns (NOT NULL): Elo (3), H2H wins (2), fatigue (4), ranking
 # (3), tournament context (3), handedness (2 — default 'U' when unknown),
 # plus identifying/label columns. Nullable: recent form (4), serve/return
-# rolling (8), h2h_recency_days, age (4), height (3), recovery (2). The
-# set of nullable columns matches the FeatureVector fields that allow None.
+# rolling (8), h2h_recency_days, age (4), height (3), recovery (2),
+# surface-specific recovery (2 — Phase 4.2). The set of nullable columns
+# matches the FeatureVector fields that allow None.
 TRAINING_FEATURES_DDL = """
 CREATE TABLE IF NOT EXISTS training_features (
     match_id                      VARCHAR PRIMARY KEY,
@@ -434,7 +452,12 @@ CREATE TABLE IF NOT EXISTS training_features (
     days_since_last_match_p1      INTEGER,
     days_since_last_match_p2      INTEGER,
 
-    schema_version                INTEGER NOT NULL DEFAULT 2
+    -- Phase 4.2: surface-specific recovery (2) — nullable on cold start
+    -- (player has no prior completed match ON THIS SURFACE); capped 365
+    days_since_last_match_surface_p1  INTEGER,
+    days_since_last_match_surface_p2  INTEGER,
+
+    schema_version                INTEGER NOT NULL DEFAULT 3
 );
 """
 
@@ -468,6 +491,7 @@ TABLE_DDL: list[str] = [
     LLM_TRACES_DDL,
     ELO_STATE_DDL,
     LAST_MATCH_STATE_DDL,
+    LAST_MATCH_PER_SURFACE_STATE_DDL,
     TRAINING_FEATURES_DDL,
     SCHEDULED_MATCHES_DDL,
     INGESTION_RUNS_DDL,
@@ -490,6 +514,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "llm_traces",
         "elo_state",
         "last_match_state",
+        "last_match_per_surface_state",
         "training_features",
         "scheduled_matches",
         "ingestion_runs",
@@ -502,30 +527,29 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
     }
 )
 
-# Phase 4.1 v2 column added that is the cleanest "did v2 already land" marker.
-# Picked from the player-metadata block — `days_since_last_match_p1` is one
-# of the new columns and is not a name that could pre-exist in any earlier
-# placeholder shape.
-_V2_SENTINEL_COLUMN: str = "days_since_last_match_p1"
+# Phase 4.2 v3 column that is the cleanest "did v3 already land" marker.
+# Picked from the surface-recovery block added in Phase 4.2 — the column
+# name cannot pre-exist in any earlier placeholder, v1, or v2 shape.
+_V3_SENTINEL_COLUMN: str = "days_since_last_match_surface_p1"
 
 
 def _migrate_training_features(conn: duckdb.DuckDBPyConnection) -> None:
-    """Idempotent migration of `training_features` to the v2 (Phase 4.1) shape.
+    """Idempotent migration of `training_features` to the v3 (Phase 4.2) shape.
 
-    Two situations to handle:
+    Three situations to handle:
 
     1. **Phase 1 placeholder** — original `(match_id, label_winner_is_p1,
        schema_version)` skeleton, no `tournament_level` column. Always
        empty. DROP it.
 
-    2. **Phase 3 shape (v1, 28 features)** — populated, but missing the
-       Phase 4.1 v2 columns (handedness, age, height, recovery). Per the
-       Phase 4.1 design doc we always re-run `scripts/build_features.py`
-       after a feature change, so the rows are about to be rewritten —
-       DROP and re-create with the v2 layout. Detection: table has
-       `tournament_level` but no `days_since_last_match_p1`.
+    2. **Phase 3 v1 shape OR Phase 4.1 v2 shape** — populated, but missing
+       the Phase 4.2 surface-recovery columns. Per the Phase 4.2 design
+       doc we always re-run `scripts/build_features.py` after a feature
+       change, so the rows are about to be rewritten — DROP and re-create
+       with the v3 layout. Detection: table has `tournament_level` but no
+       `days_since_last_match_surface_p1`.
 
-    Once the v2 layout is in place, this function is a no-op.
+    Once the v3 layout is in place, this function is a no-op.
     """
     table_exists = (
         conn.execute(
@@ -548,18 +572,18 @@ def _migrate_training_features(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute("DROP TABLE training_features")
         return
 
-    has_v2_sentinel = (
+    has_v3_sentinel = (
         conn.execute(
             "SELECT 1 FROM information_schema.columns "
             "WHERE table_name = 'training_features' AND column_name = ?",
-            [_V2_SENTINEL_COLUMN],
+            [_V3_SENTINEL_COLUMN],
         ).fetchone()
         is not None
     )
-    if not has_v2_sentinel:
-        # Phase 3 v1 shape — feature set changed in Phase 4.1, rebuild.
-        # `scripts/build_features.py` is always re-run after a feature
-        # change, so the rows are about to be regenerated.
+    if not has_v3_sentinel:
+        # Phase 3 v1 or Phase 4.1 v2 shape — feature set changed in
+        # Phase 4.2, rebuild. `scripts/build_features.py` is always re-run
+        # after a feature change, so the rows are about to be regenerated.
         conn.execute("DROP TABLE training_features")
 
 

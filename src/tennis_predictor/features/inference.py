@@ -62,6 +62,7 @@ from tennis_predictor.features.elo import EloState
 from tennis_predictor.features.fatigue import FatigueState, count_sets
 from tennis_predictor.features.h2h import H2HState
 from tennis_predictor.features.last_match import LastMatchState
+from tennis_predictor.features.last_match_surface import LastMatchPerSurfaceState
 from tennis_predictor.features.player_metadata import (
     PlayerMetadataLookup,
     compute_age,
@@ -161,9 +162,11 @@ def compute_features(
     # from when `as_of_date` is strictly later than the snapshot.
     if elo_baseline_date is not None:
         last_match = LastMatchState.from_db(conn)
+        last_match_surface = LastMatchPerSurfaceState.from_db(conn)
         last_match_baseline_date: date | None = elo_baseline_date
     else:
         last_match = LastMatchState()
+        last_match_surface = LastMatchPerSurfaceState()
         last_match_baseline_date = None
 
     # Build the rest of the states fresh by replaying every completed
@@ -184,6 +187,8 @@ def compute_features(
         if last_match_baseline_date is None or h.match_date > last_match_baseline_date:
             last_match.update(h.winner_id, h.match_date)
             last_match.update(h.loser_id, h.match_date)
+            last_match_surface.update(h.winner_id, h.surface, h.match_date)
+            last_match_surface.update(h.loser_id, h.surface, h.match_date)
 
     # Snapshots.
     elo_p1 = elo.get(p1, surface)
@@ -204,6 +209,8 @@ def compute_features(
     age_p2 = compute_age(meta_p2.dob, as_of_date)
     days_since_p1 = last_match.days_since(p1, as_of_date)
     days_since_p2 = last_match.days_since(p2, as_of_date)
+    days_since_p1_surface = last_match_surface.days_since(p1, surface, as_of_date)
+    days_since_p2_surface = last_match_surface.days_since(p2, surface, as_of_date)
 
     return FeatureVector.model_validate(
         {
@@ -246,6 +253,8 @@ def compute_features(
             "height_diff_cm": compute_height_diff(meta_p1.height, meta_p2.height),
             "days_since_last_match_p1": days_since_p1,
             "days_since_last_match_p2": days_since_p2,
+            "days_since_last_match_surface_p1": days_since_p1_surface,
+            "days_since_last_match_surface_p2": days_since_p2_surface,
         }
     )
 
