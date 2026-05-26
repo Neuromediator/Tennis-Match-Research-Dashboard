@@ -21,6 +21,7 @@ from tennis_predictor.app.widgets import (
     is_data_stale,
     query_cost_summary,
     query_last_hot_refresh,
+    query_matchstat_usage_month,
 )
 from tennis_predictor.data import schema
 
@@ -243,3 +244,59 @@ def test_is_data_stale_naive_datetime_is_treated_as_utc() -> None:
     now = datetime(2026, 5, 23, 12, 0, tzinfo=UTC)
     last = datetime(2026, 5, 23, 11, 0)  # 1h ago, naive
     assert is_data_stale(last, now=now) is False
+
+
+# ---------------------------------------------------------------------------
+# Matchstat usage aggregator (Phase 6.2 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_query_matchstat_usage_sums_ingestion_runs_and_quota(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    """matchstat usage = SUM(ingestion_runs.requests_used for current
+    month) + matchstat_quota.requests_used (per-prediction calls)."""
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+
+    # Two May refresh runs at 13 and 15 credits.
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, tour, started_at, status, "
+        "rows_added, rows_skipped, rows_failed, requests_used, error_message, notes) "
+        "VALUES ('r1', 'matchstat', NULL, ?, 'success', 0, 0, 0, 13, NULL, NULL)",
+        [datetime(2026, 5, 24, 6, 0)],
+    )
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, tour, started_at, status, "
+        "rows_added, rows_skipped, rows_failed, requests_used, error_message, notes) "
+        "VALUES ('r2', 'matchstat', NULL, ?, 'success', 0, 0, 0, 15, NULL, NULL)",
+        [datetime(2026, 5, 25, 6, 0)],
+    )
+    # A previous-month refresh — must NOT be counted.
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, tour, started_at, status, "
+        "rows_added, rows_skipped, rows_failed, requests_used, error_message, notes) "
+        "VALUES ('r-old', 'matchstat', NULL, ?, 'success', 0, 0, 0, 99, NULL, NULL)",
+        [datetime(2026, 4, 28, 6, 0)],
+    )
+    # A non-matchstat refresh in the same month — must NOT be counted.
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, tour, started_at, status, "
+        "rows_added, rows_skipped, rows_failed, requests_used, error_message, notes) "
+        "VALUES ('r-odds', 'the_odds_api', NULL, ?, 'success', 0, 0, 0, 3, NULL, NULL)",
+        [datetime(2026, 5, 25, 7, 0)],
+    )
+    # Per-prediction quota for the current month.
+    conn.execute(
+        "INSERT INTO matchstat_quota (month, requests_used, cap) VALUES ('2026-05', 7, 500)"
+    )
+
+    used, cap = query_matchstat_usage_month(conn, now=now)
+    assert used == 13 + 15 + 7
+    assert cap == 500
+
+
+def test_query_matchstat_usage_empty_returns_zero(conn: duckdb.DuckDBPyConnection) -> None:
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=UTC)
+    used, cap = query_matchstat_usage_month(conn, now=now)
+    assert used == 0
+    assert cap == 500

@@ -168,7 +168,14 @@ def cost_monitor_block(conn: duckdb.DuckDBPyConnection) -> None:
     cols[2].metric(
         "Cache hit rate (24h)",
         f"{summary.cache_hit_rate_24h * 100:.0f}%",
-        help="cache_read / (tokens_in + cache_read + cache_creation)",
+        help=(
+            "Fraction of INPUT TOKENS (not requests) served from Anthropic's "
+            "prompt cache over the last 24h. Formula: cache_read / "
+            "(tokens_in + cache_read + cache_creation). First call in a "
+            "5-min TTL window scores 0 (cache miss + write); subsequent "
+            "calls score high. Higher = lower input cost (cached tokens "
+            "are billed at 10% of fresh-input rate)."
+        ),
     )
     cols[3].metric(
         "Web searches today",
@@ -964,8 +971,7 @@ def recent_predictions_scoreboard(conn: duckdb.DuckDBPyConnection, *, limit: int
 
 def odds_api_quota_block(conn: duckdb.DuckDBPyConnection) -> None:
     """Render a single-row indicator showing The Odds API month-to-date
-    quota usage. Pulled into the Dashboard so the user can see "M/500
-    credits used" at a glance."""
+    quota usage."""
     from tennis_predictor.data.pre_match_odds import quota_status
 
     used, cap = quota_status(conn)
@@ -973,8 +979,68 @@ def odds_api_quota_block(conn: duckdb.DuckDBPyConnection) -> None:
     color = "🟢" if pct < 80 else ("🟡" if pct < 95 else "🔴")
     st.markdown(f"{color} **The Odds API** — {used}/{cap} credits this month (~{pct:.0f}% used)")
     st.caption(
-        "Daily refresh consumes ~4-6 credits + lazy refresh on Prediction-page "
-        "load adds ~1 per cache miss. Total expected: 150-210/month."
+        "Counts only billable `/sports/{key}/odds` calls (1 credit each at "
+        "`regions=eu`). The `/sports` discovery call is free per The Odds "
+        "API docs and not counted here. Daily refresh consumes ~4-6 "
+        "credits; lazy refresh on Prediction-page load adds ~1 per cache "
+        "miss. Expected total: 150-210/month."
+    )
+
+
+def query_matchstat_usage_month(
+    conn: duckdb.DuckDBPyConnection, now: datetime | None = None
+) -> tuple[int, int]:
+    """Authoritative month-to-date matchstat API usage.
+
+    Two disjoint sources count toward the matchstat 500/month free-tier
+    cap and we have historically split them across two tables:
+
+    - `ingestion_runs(source='matchstat').requests_used` — every hot
+      refresh (`scripts/refresh_hot.py`) logs its total HTTP-call count
+      here. This is the dominant source (~13-15 calls per refresh).
+    - `matchstat_quota.requests_used` — incremented by the Phase 6.1
+      live fetcher (`MatchstatLiveFetcher`) on per-prediction H2H or
+      past-match calls that miss the 24h DuckDB cache.
+
+    Neither source overlaps with the other; sum gives the real total
+    against the 500/month cap. Returns `(used_total, cap)`."""
+    moment = now or datetime.now(UTC)
+    month_start = datetime(moment.year, moment.month, 1, tzinfo=UTC).replace(tzinfo=None)
+    ingestion_sum = conn.execute(
+        """
+        SELECT COALESCE(SUM(requests_used), 0) FROM ingestion_runs
+        WHERE source = 'matchstat' AND started_at >= ?
+        """,
+        [month_start],
+    ).fetchone()
+    ingestion = int(ingestion_sum[0]) if ingestion_sum else 0
+
+    month_key = f"{moment.year:04d}-{moment.month:02d}"
+    quota_row = conn.execute(
+        "SELECT requests_used, cap FROM matchstat_quota WHERE month = ?", [month_key]
+    ).fetchone()
+    quota_used = int(quota_row[0]) if quota_row else 0
+    cap = int(quota_row[1]) if quota_row else 500
+    return ingestion + quota_used, cap
+
+
+def matchstat_quota_block(conn: duckdb.DuckDBPyConnection) -> None:
+    """Render a matchstat usage indicator that unifies the two count
+    sources (hot-refresh `ingestion_runs` + per-prediction `matchstat_quota`)
+    so the user sees ONE authoritative `M/500` number."""
+    used, cap = query_matchstat_usage_month(conn)
+    pct = (used / cap) * 100 if cap else 0
+    color = "🟢" if pct < 80 else ("🟡" if pct < 95 else "🔴")
+    st.markdown(
+        f"{color} **matchstat (RapidAPI)** — {used}/{cap} requests this month (~{pct:.0f}% used)"
+    )
+    st.caption(
+        "Sum of: hot-refresh calls logged in `ingestion_runs` (daily ~13-15 "
+        "credits — calendar + per-tournament fixtures + rankings + Slam "
+        "results) AND per-prediction H2H/past-matches calls logged in "
+        "`matchstat_quota` (3 credits per fresh prediction, 0 on 24h cache "
+        "hit). At ≥480/500 the live fetcher raises `MatchstatBudgetExceeded` "
+        "and falls back to Sackmann cold data."
     )
 
 
@@ -991,12 +1057,14 @@ __all__ = [
     "freshness_indicator",
     "h2h_block",
     "is_data_stale",
+    "matchstat_quota_block",
     "news_block",
     "odds_api_quota_block",
     "player_autocomplete",
     "prediction_card",
     "query_cost_summary",
     "query_last_hot_refresh",
+    "query_matchstat_usage_month",
     "query_player_autocomplete_options",
     "recent_form_table_two_column",
     "recent_predictions_scoreboard",

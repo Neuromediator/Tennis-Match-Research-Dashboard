@@ -16,6 +16,7 @@ from tennis_predictor.app.db import DuckDBLockError, get_connection
 from tennis_predictor.app.widgets import (
     back_to_home_button,
     cost_monitor_block,
+    matchstat_quota_block,
     odds_api_quota_block,
     recent_predictions_scoreboard,
     stale_data_banner,
@@ -38,7 +39,8 @@ stale_data_banner(conn)
 st.subheader("Recent predictions vs market")
 recent_predictions_scoreboard(conn)
 
-st.subheader("Pre-match odds quota")
+st.subheader("External API usage (month-to-date)")
+matchstat_quota_block(conn)
 odds_api_quota_block(conn)
 
 # ---------------------------------------------------------------------------
