@@ -357,7 +357,7 @@ Each phase has entry criteria (what must be true before starting), deliverables 
 
 ---
 
-## Phase 6.2 — Re-scope: predictor → tennis context dashboard  🟡 design locked, implementation pending
+## Phase 6.2 — Re-scope: predictor → tennis context dashboard  ✅ implementation complete (10-match acceptance pending)
 
 **Entry:** Phase 6.1 close-out manual smoke (2026-05-25) exposed that the calibrated LightGBM probability is unreliable on real top matches:
 - Cina-Opelka: model 37% on the actual favourite (Cina), market 64% — **inverted favourite**
@@ -426,6 +426,61 @@ Average Brier 0.21 vs market 0.20 in Phase 4 masked these tail failures because 
   - Then **Step 2** (The Odds API integration — 6-8 hours; can be done in parallel by a sub-agent if desired).
   - Then UI: Step 3, 5, 6, 7.
   - Final: Step Phase-3 acceptance test (10 real matches walkthrough). Phase does not close until this is green.
+
+---
+
+## Phase 6.2 follow-up — refresh refactor, UX fixes, prompt hardening  ✅ complete
+
+**Entry:** Phase 6.2 implementation shipped; first-day live use on Roland Garros 2026 exposed a cluster of data-layer and UX issues. All addressed in a single follow-up pass without changing the product framing.
+
+**What changed:**
+
+1. **matchstat fixture refresh switched from per-date to per-tournament.**
+   - Phase 6.2 implementation pulled `/{tour}/fixtures/{date}` for `today + lookahead` days. matchstat only returns matches whose Order of Play has been published for each specific day, so Slam R1 fixtures whose OoP gets announced later in the day were systematically missed.
+   - New flow: `_discover_active_tournament_ids` probes `/fixtures/{today}` once per tour, filters to `tournament.rank.name in {"Grand Slam", "Main tour"}`, then `_refresh_fixtures_for_tournament` pulls `/fixtures/tournament/{id}` for each active tournament. One credit per tournament, returns every round matchstat knows about (R1 + R2 + R3 + ... + F).
+   - Net cost: ~7-9 credits per refresh (down from ~13), with strictly more data.
+   - `fixture_lookahead_days` parameter kept for the prune-window only; no longer drives the fetch loop.
+   - Tests: new `FakeMatchstatClient.set_tournament_fixtures`; regression test `test_refresh_hot_per_tournament_pulls_rounds_not_in_today_payload`.
+
+2. **Four prune passes — robustness fixes:**
+   - `_prune_stale_scheduled_matches` (was already there) — drop rows matchstat stopped returning, scoped to the active date window.
+   - `_prune_contradicted_round_fixtures` (new) — if player X is in both R1 and R2 at the same tournament, R1 is stale (Bonzi-Zverev case).
+   - `_prune_duplicate_matchups` (new) — same matchup under two different `fixture_external_id`s (Sinner-Tabur 1294 + 1295) → keep most-recently-ingested.
+   - `_prune_completed_slam_fixtures` (new) — for active Grand Slam tournaments, call `/tournament/results/{id}` and DELETE rows whose pair matchstat lists as completed (Duckworth-Diallo case). 1-2 extra API calls in a Slam week.
+   - `ON CONFLICT DO UPDATE` clause in `insert_scheduled_matches` extended to refresh player names + external IDs (matchstat **re-uses fixture_external_id** for different matchups — Popyrin-Svajda took over 1271 from Griekspoor-Arnaldi).
+
+3. **H2H endpoint URL fix + winner-from-score fallback.**
+   - URL changed from `/{tour}/fixtures/h2h/{a}/{b}` (which returned upcoming fixtures only) to `/{tour}/h2h/matches/{a}/{b}` (completed history). Eliminates the Svitolina-Bondar "score unknown" pattern from Phase 6.1.
+   - `RichMatch.result_type` is read and the consumer defensively keeps only `result_type in (None, "completed")` rows.
+   - New helpers `infer_winner_from_score(result)` + `winner_index(match_winner, result)`: matchstat returns `matchWinner: null` on many older H2H rows; we now parse the score string to determine the winner (Khachanov-Trungelliti 2016 case where matchstat said `matchWinner: null` and our code defaulted to "player 2 won").
+
+4. **Time display — DATE only on Home page upcoming list.**
+   - matchstat returns `T12:00:00.000Z` for most Slam outside-court fixtures as a day-level placeholder, indistinguishable from a genuine 11:00 CEST start. Rendering all of them as "11:00 CEST" misled — 17 matches at the same hour is physically impossible across the available courts.
+   - Home view now renders just `"Tue, May 26"` for every row. No `time_confirmed` heuristic, no "TBD" branch.
+   - Lookback filter switched from time-based `now - 5h` to date-based `DATE(scheduled_start_utc) >= today_utc`. Today's matches stay visible all day regardless of when matchstat claims they start.
+   - Match Dashboard (per-fixture page) still calls `format_match_time_for_display` when relevant.
+
+5. **Tour filter + tournament grouping on Home.**
+   - Horizontal radio `All / ATP / WTA` at top of upcoming list.
+   - Two-level grouping: tour → tournament. ATP renders before WTA. Same tournament-name across tours (e.g., French Open) no longer shares a header.
+
+6. **"Refresh fixtures" button on Home.**
+   - Synchronous button that runs `refresh_hot(...)` on demand. Lets the user pull mid-day schedule updates without waiting for the next cron.
+
+7. **`why_model_differs` panel — two new rules + generic fallback.**
+   - Phase 6.2 original rules (activity gap / stale Elo / career asymmetry) didn't fire on cases like Baez-Burruchaga, where both players are active, both have fresh Elo, both are mid-tour, yet model + surface-Elo both pick the lower-ranked underdog against a rank-driven market.
+   - Added: (a) `check_surface_elo_agrees_with_model` — when model AND surface-Elo both lean ≥ 5pp against the market; (b) `check_recent_form_gap` — surface-specific win-rate gap ≥ 30pp over last 60 days; (c) explicit "unexplained" fallback that fires when the page-level 10pp trigger asked for an explanation but none of the structural rules matched. The panel can no longer go silent on a > 10pp gap (Hard rule #12 structurally enforceable).
+
+8. **LLM stale-news rules tightened.**
+   - Tavily request now uses `topic="news"` + `days=32` (server-side recency filter).
+   - System prompt rewritten with **generic** drop patterns (no longer name-specific examples that overfit): tournament-calendar-slot inference, "withdraws at <tournament>" + null date, multi-year retrospectives, name-collision sanity check (Arthur Fils ≠ Gael Monfils).
+   - Date-unknown items now require explicit recency anchors in snippet/title; previously they were kept by default.
+
+**Effort:** ~6 hours (single afternoon iteration). All tests green (484 pass, 5 skipped Phase 5 fixtures).
+
+**Open follow-up** (not blocking phase close):
+- `time_confirmed` column on `scheduled_matches` is now dead code; harmless to keep, can be dropped in a future cleanup.
+- 10-match acceptance walkthrough using the new "why differs" rules — pending; the user has the data exported (`data/processed/2026-05-25T20-22_export.csv`).
 
 ---
 

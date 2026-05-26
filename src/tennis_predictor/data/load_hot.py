@@ -29,7 +29,6 @@ from tennis_predictor.data.matchstat import (
     Match,
     RankingEntry,
     fixture_on_court_time,
-    is_day_level_placeholder,
 )
 
 SOURCE_MATCHSTAT = "matchstat"
@@ -210,13 +209,20 @@ def insert_scheduled_matches(
         # corrects rows written before tz-normalization landed. We still
         # count an UPDATE as "skipped" (row already existed) so the
         # ingestion_runs row reflects new inserts only.
-        # Phase 6.2: matchstat returns the on-court time in `date` when
-        # confirmed; otherwise `date` is a `YYYY-MM-DDT12:00:00Z`
-        # day-level placeholder and the actual time is TBD. We persist
-        # both the time and a `time_confirmed` flag so the Home page
-        # can render "Tomorrow — time TBD" instead of a fake "11:00 CEST".
+        # Phase 6.2: prefer `timeGame` over `date` when matchstat sets
+        # it (carries an alternate on-court time when present).
+        #
+        # `time_confirmed` is kept in the schema for back-compat but
+        # always stored as True after Phase 6.2 follow-up — matchstat's
+        # `T12:00:00Z` is ambiguous (it represents both a genuine 11:00
+        # CEST morning-wave start AND a day-level placeholder), and the
+        # two cases are indistinguishable in the wire format. The user
+        # decision was to always display matchstat's time as an
+        # estimated start (Slam start times are inherently approximate
+        # — rain delays, previous-match overruns — so showing the
+        # estimate is more useful than hiding it behind "time TBD").
         on_court_time = fixture_on_court_time(fx.date, fx.time_game)
-        time_confirmed = on_court_time is not None and not is_day_level_placeholder(on_court_time)
+        time_confirmed = on_court_time is not None
         conn.execute(
             """
             INSERT INTO scheduled_matches (

@@ -339,6 +339,9 @@ def render_prediction_page(conn, ctx: MatchContext) -> None:
                     player_b_name=ctx.player_b_name,
                     surface=ctx.surface,
                     as_of_date=ctx.match_date,
+                    model_prob_a=comparison.model_prob_a,
+                    market_prob_a=comparison.market_prob_a,
+                    surface_elo_prob_a=comparison.surface_elo_prob_a,
                 )
                 why_model_differs_block(reasons)
         st.divider()

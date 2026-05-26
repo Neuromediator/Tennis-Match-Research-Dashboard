@@ -15,7 +15,6 @@ from tennis_predictor import config
 from tennis_predictor.app.context import infer_tournament_level
 from tennis_predictor.app.db import DuckDBLockError, get_connection
 from tennis_predictor.app.widgets import (
-    format_match_time_for_display,
     query_last_hot_refresh,
     stale_data_banner,
 )
@@ -82,27 +81,29 @@ with ctrl_col2:
         st.caption("No matchstat refresh on record yet.")
 
 now = datetime.now(UTC)
-horizon = now + timedelta(days=7)
-# Phase 6.2 fix: previously this window extended `now - 1d`, which left
-# already-finished fixtures on the Home page until the daily promotion
-# moved them out of `scheduled_matches`. The first iteration shrank it
-# to `now - 1h`, which over-corrected and hid matches that started a
-# few hours ago but are still on court — a Slam best_of=5 routinely
-# runs 4-5h. `now - 5h` covers in-progress tennis matches while still
-# dropping anything that has clearly finished.
-lookback = now - timedelta(hours=5)
+today_utc = now.date()
+horizon_date = today_utc + timedelta(days=7)
+# Phase 6.2 follow-up: filter is now DATE-based, not time-based.
+# Reason: matchstat returns `T12:00:00Z` for most Slam outside-court
+# matches as a day-level placeholder (verified via /fixtures/tournament
+# probe — see prompts.py rationale). The previous time-based 5h
+# lookback dropped a match scheduled for evening as soon as 16:00 local
+# rolled past, because its stored `scheduled_start_utc` was the
+# misleading 09:00 UTC placeholder. Switching to DATE comparison keeps
+# every match for "today" visible all day, regardless of when matchstat
+# claims it starts.
 
 raw_rows = conn.execute(
     """
     SELECT scheduled_match_id, tour, tournament_name, tournament_tier,
            round_name, surface, player1_name, player2_name,
-           scheduled_start_utc, time_confirmed
+           scheduled_start_utc
     FROM scheduled_matches
     WHERE scheduled_start_utc IS NULL
-       OR scheduled_start_utc BETWEEN ? AND ?
+       OR DATE(scheduled_start_utc) BETWEEN ? AND ?
     ORDER BY scheduled_start_utc NULLS LAST, tournament_name, round_name
     """,
-    [lookback, horizon],
+    [today_utc, horizon_date],
 ).fetchall()
 
 # Drop fixtures whose tournament we can't map onto a model
@@ -169,27 +170,24 @@ else:
                 player1_name,
                 player2_name,
                 scheduled_start_utc,
-                time_confirmed,
             ) in group:
                 cols = st.columns([4, 2, 3, 1])
                 cols[0].write(f"**{player1_name}** vs **{player2_name}**")
                 cols[1].write(round_name or "—")
-                # Phase 6.1: honest TZ labelling — never write "UTC" next to
-                # a non-UTC value. `format_match_time_for_display` renders
-                # local CEST + UTC and falls back to "TBD" on None.
-                # Phase 6.2: when matchstat gave only a day-level
-                # placeholder (`time_confirmed = False`), show the date
-                # and an explicit "time TBD" instead of a fake hour.
-                if scheduled_start_utc is None:
-                    start_label = "TBD"
-                elif time_confirmed is False:
-                    # NULL is treated as "trust the stored time" — that's
-                    # the pre-Phase-6.2 default for rows that pre-date
-                    # the `time_confirmed` migration.
-                    start_label = scheduled_start_utc.strftime("%a, %b %-d") + " — time TBD"
-                else:
-                    start_label = format_match_time_for_display(scheduled_start_utc)
-                cols[2].write(f"{surface or '—'} · {start_label}")
+                # Phase 6.2 follow-up: render DATE only, no start time.
+                # matchstat's start-time payload is unreliable for most
+                # Slam outside-court matches (returns `T12:00:00Z` as a
+                # day-level default for everything not on a featured
+                # court). Showing 17 matches all at "11:00 CEST"
+                # misleads more than it informs, and showing nothing
+                # at all gives the user a clean "this match is today
+                # / tomorrow / ..." signal.
+                date_label = (
+                    scheduled_start_utc.strftime("%a, %b %-d")
+                    if scheduled_start_utc is not None
+                    else "TBD"
+                )
+                cols[2].write(f"{surface or '—'} · {date_label}")
                 if cols[3].button("Predict", key=f"predict::{scheduled_match_id}"):
                     st.session_state[PENDING_MATCH_KEY] = scheduled_match_id
                     st.query_params["match_id"] = scheduled_match_id
