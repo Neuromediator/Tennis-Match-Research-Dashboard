@@ -11,43 +11,17 @@ from datetime import UTC, datetime, timedelta
 
 import streamlit as st
 
-from tennis_predictor import config
 from tennis_predictor.app.context import infer_tournament_level
 from tennis_predictor.app.db import DuckDBLockError, get_connection
 from tennis_predictor.app.widgets import (
     query_last_hot_refresh,
     stale_data_banner,
 )
-from tennis_predictor.data.matchstat import MatchstatClient
-from tennis_predictor.data.refresh_hot import refresh_hot
 
 PENDING_MATCH_KEY = "pending_match_id"
 # Path is resolved relative to the entry-point script (`app/main.py`), the
 # same root `st.Page(...)` declarations use.
 PREDICTION_PAGE_PATH = "views/prediction.py"
-
-
-def _trigger_hot_refresh() -> tuple[bool, str]:
-    """Run the hot refresh once. Returns (success, message). Used by the
-    "Refresh now" button — matchstat publishes fixtures incrementally
-    throughout the day (Roland Garros 2026: main-court times confirmed
-    first, then other courts hours later), so a daily refresh leaves
-    gaps. Click cost: ~13-15 matchstat credits."""
-    if config.X_RAPIDAPI_KEY is None:
-        return False, "X_RAPIDAPI_KEY not configured."
-    try:
-        # Build a separate client per click (no shared state with the
-        # Streamlit DB connection). Quota tracking is handled inside
-        # `refresh_hot` via `ingestion_runs`.
-        with MatchstatClient(api_key=config.X_RAPIDAPI_KEY) as client:
-            summary = refresh_hot(conn, client, tours=["ATP", "WTA"])
-    except Exception as exc:  # surface to user, never crash the page
-        return False, f"{type(exc).__name__}: {exc}"
-    total = summary.totals
-    return True, (
-        f"status={summary.status} · added={total.added} · "
-        f"skipped={total.skipped} · matchstat calls={summary.requests_used}"
-    )
 
 
 st.title("Upcoming matches")
@@ -58,27 +32,20 @@ except DuckDBLockError as exc:
     st.stop()
 stale_data_banner(conn)
 
-# Refresh control: button + freshness age. Costs ~13 matchstat credits
-# per click; the user owns when to pay that cost.
+# Show "last refresh" age only — no manual trigger. The daily Fly.io
+# scheduled-machine job runs `scripts/refresh_hot.py` in the evening
+# UTC (set up during Phase 7 deploy). Letting users click a Refresh
+# button from the public URL exposes us to budget-draining click spam
+# against the 500/month matchstat free tier, so the path is removed
+# entirely.
 last_refresh = query_last_hot_refresh(conn)
-ctrl_col1, ctrl_col2 = st.columns([2, 6])
-with ctrl_col1:
-    if st.button("Refresh fixtures", type="secondary"):
-        with st.spinner("Pulling fresh fixtures from matchstat…"):
-            ok, msg = _trigger_hot_refresh()
-        if ok:
-            st.success(msg)
-        else:
-            st.error(msg)
-        st.rerun()
-with ctrl_col2:
-    if last_refresh is not None:
-        age = datetime.now(UTC) - last_refresh
-        mins = int(age.total_seconds() // 60)
-        age_label = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
-        st.caption(f"Last fixtures refresh: {age_label} ago")
-    else:
-        st.caption("No matchstat refresh on record yet.")
+if last_refresh is not None:
+    age = datetime.now(UTC) - last_refresh
+    mins = int(age.total_seconds() // 60)
+    age_label = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+    st.caption(f"Last fixtures refresh: {age_label} ago (auto, daily evening UTC).")
+else:
+    st.caption("No matchstat refresh on record yet.")
 
 now = datetime.now(UTC)
 today_utc = now.date()

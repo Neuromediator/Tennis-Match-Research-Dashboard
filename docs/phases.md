@@ -537,7 +537,7 @@ Average Brier 0.21 vs market 0.20 in Phase 4 masked these tail failures because 
 
 3. **Secrets via `fly secrets set`** — `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`. Never committed.
 
-4. **Daily hot refresh — separate Fly.io scheduled machine** running `uv run python scripts/refresh_hot.py` once per day (~03:00 UTC, off-peak). Mounts the same `/data` volume as the app. Writes to `ingestion_runs`; the app reads freshness from there. Why scheduled-machine over GitHub Actions: tight coupling to the same volume, no need to set up SSH / a refresh-trigger HTTP endpoint in the app, ~$0.50/month extra at most.
+4. **Daily hot refresh — separate Fly.io scheduled machine** running `uv run python scripts/refresh_hot.py` once per day at **21:00 UTC** (chosen instead of off-peak 03:00 UTC because Order of Play is typically published late evening venue-local; an evening UTC run catches the freshest next-day schedule for the 24-hour window the app will serve). Mounts the same `/data` volume as the app. Writes to `ingestion_runs`; the app reads freshness from there. Why scheduled-machine over GitHub Actions: tight coupling to the same volume, no need to set up SSH / a refresh-trigger HTTP endpoint in the app, ~$0.50/month extra at most. The Streamlit UI no longer exposes a manual "Refresh fixtures" button (removed in the pre-deploy hardening pass) — public-URL exposure to click-spam against the 500/month matchstat free tier would be the dominant abuse vector.
 
 5. **Rate limiting + hard cap** (the only abuse protection, see "Auth strategy" above):
    - **Per-IP:** 5 predictions / IP / 24h, stored in a small JSON file on the volume. Sufficient to block single-IP scrapers while letting your own daily use through.

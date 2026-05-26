@@ -4,6 +4,19 @@ Examples:
     uv run python scripts/refresh_hot.py
     uv run python scripts/refresh_hot.py --tours ATP
     uv run python scripts/refresh_hot.py --date 2026-05-15
+
+Scheduling (production):
+    Runs once per day from a Fly.io scheduled machine at **21:00 UTC**
+    (~23:00 CEST, ~17:00 EDT) — Order of Play for the next day is
+    typically published by tournaments late evening venue-local time,
+    so the evening UTC slot catches the freshest schedule for the
+    24-hour window the app will serve until the next refresh. See
+    Phase 7 in `docs/phases.md` for the Fly.io machine config.
+
+    Local development can use a cron / systemd-timer equivalent, but
+    the Streamlit UI no longer exposes a manual refresh button — that
+    was removed before deployment to prevent click-spam draining the
+    500/month matchstat free tier.
 """
 
 from __future__ import annotations
