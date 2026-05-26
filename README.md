@@ -1,58 +1,36 @@
 # Tennis Match Research Dashboard
 
-A research dashboard comparing **market consensus odds** (auto-fetched from The Odds API), a trained **LightGBM model**, and a **surface-Elo baseline** for upcoming ATP and WTA tour-level singles. For each fixture it surfaces an LLM-discovered news block (injuries, withdrawals, coach changes, recent results) and detailed H2H + last-8-matches per player. When the model disagrees with the market by > 10pp, a deterministic panel explains the gap structurally (stale surface-Elo, activity asymmetry, returning veteran). **The model is one signal, not the answer.**
+**Production-grade LLM agent engineering on a real domain.** The dashboard renders four independent signals side by side for every upcoming ATP / WTA tour-level singles match — market consensus odds, a trained LightGBM probability, a surface-Elo baseline, an LLM-discovered news block — plus a deterministic *"why model differs"* panel whenever the model-vs-market gap exceeds 10pp.
 
-**Not a betting tool — we do not claim to beat the market.** Phase 6.2 explicitly reframed the product from "predictor" to "context dashboard" after Phase 6.1 close-out exposed that the calibrated LightGBM probability is unreliable on top matchups (inverted favourites at the Cina-Opelka / Sinner-Djokovic level). See [`docs/tutorials/phase_6_2_notes.md`](docs/tutorials/phase_6_2_notes.md) for the full rescope rationale.
-
-**Status:** Phases 1-6.1 complete; Phase 6.2 (research-dashboard reframing + The Odds API integration + UI bug bundle) is the current phase — see [docs/phases.md](docs/phases.md). Phase 7 (Fly.io deployment) is next.
-
-**Aggregate model metrics** (last-5-fold sample-weighted Brier, post-calibration): ATP LightGBM **0.2101**, WTA LightGBM **0.1954**, both ahead of the Surface-Elo baseline (ATP 0.2220, WTA 0.2180). These averages hide tail-failure on top matches — see the reality-test rationale in the Phase 6.2 notes.
-
-See [docs/architecture.md](docs/architecture.md), [docs/methodology.md](docs/methodology.md), and [docs/phases.md](docs/phases.md) for details.
+Started as a *"tennis match predictor"*. Live use during Roland Garros 2026 showed the model couldn't beat the market on top matches (structural Elo limits, not a training bug). Rather than hide that behind average-Brier metrics, the product was **explicitly rescoped to a research dashboard**: the model stays visible but as one signal among several. Built to demonstrate end-to-end ML engineering on a real domain, including the maturity to admit and document limits. **Not a betting tool.**
 
 ## Quick start
 
 ```bash
-# Install dependencies (Python 3.12+ required, pinned via .python-version)
+# Python 3.12+ pinned via .python-version. Install with uv.
 uv sync
 
-# Run the full test suite
-uv run pytest
+# Build everything from public data (~30 min cold start).
+uv run python scripts/refresh_data.py            # Sackmann historical
+uv run python scripts/refresh_hot.py             # matchstat fixtures + rankings
+uv run python scripts/refresh_pre_match_odds.py  # The Odds API pre-match h2h
+uv run python scripts/build_features.py          # training_features + elo_state
+uv run python scripts/train_models.py            # 4 artifacts: ATP/WTA × Elo/LightGBM
 
-# Rebuild the cold data layer (Sackmann + tennis-data.co.uk)
-uv run python scripts/refresh_data.py            # incremental (default)
-uv run python scripts/refresh_data.py --clean    # full rebuild from scratch
-
-# Daily hot refresh (matchstat fixtures + rankings)
-uv run python scripts/refresh_hot.py
-
-# Promote reviewed aliases (after editing data/processed/aliases_review*.csv)
-uv run python scripts/apply_aliases_review.py
-
-# Build the training_features table + persist elo_state + last_match_state (phases 3 / 4.1)
-uv run python scripts/build_features.py
-
-# Train the four production models (Elo + LightGBM per tour) — phases 4 / 4.1
-uv run python scripts/train_models.py
-
-# (later phases)
-uv run streamlit run src/tennis_predictor/app/main.py  # phase 6+
+# Run the app.
+uv run streamlit run src/tennis_predictor/app/main.py
 ```
 
-After `refresh_data.py`, the DuckDB file lives at `data/processed/tennis.duckdb`. Audit artefacts (low-confidence resolutions, unmatched rows) live alongside it.
+Env vars (in `.env`, template in `.env.example`): `ANTHROPIC_API_KEY`, `X_RAPIDAPI_KEY` (matchstat), `THE_ODDS_API_KEY`, `TAVILY_API_KEY`. Quality gates: `uv run ruff check . && uv run ruff format --check . && uv run pyright && uv run pytest`.
 
-## Headline numbers after phase 1
+## What's inside
 
-- 137,318 players (ATP + WTA, composite IDs `ATP_<id>` / `WTA_<id>`)
-- 1,701,617 matches across all tiers (~360k tour-level singles)
-- 5,559,400 weekly rankings
-- ~52,000 market-implied probabilities for 2013-current
-- 75% median match rate vs. tennis-data.co.uk archive
+- **LLM agent** — direct Anthropic SDK, prompt caching (~70% input savings), bounded budget (4 iter / 30k tok / 120s / 2 searches), `tool_use` structured output (schema forbids LLM-emitted probability + free-text synthesis), Tavily news search with server-side recency filter, full per-call observability in `llm_traces`.
+- **Data engineering** — three flaky sources reconciled. Sackmann cold (1.7M matches), matchstat hot (per-tournament endpoint + 4 prune passes — stale / round-contradicted / duplicate-matchups / completed-Slam cross-check), The Odds API with hyphen-normalised name matching + Tavily fallback.
+- **Model** — LightGBM v3 (44 features), walk-forward 8-fold + isotonic calibration. Last-5-fold Brier (post-cal): ATP **0.2087** / WTA **0.1959** vs Surface-Elo baseline 0.2220 / 0.2180 and market ~0.20. Betting odds are **never** training features (CLAUDE.md hard rule #3).
 
-## What you get
+## Read more
 
-- A calibrated win probability for any upcoming ATP or WTA tour-level singles match, computed from public match data only.
-- An LLM-written narrative that explains the prediction's `key_factors`, surfaces recent news (withdrawals, injuries, form), and tags the result with a qualitative `confidence_band`. The LLM never overrides the model's number — it contextualizes it.
-- A dashboard showing the model's calibration over time vs. the market's calibration on the same matches — so you can judge how much to trust any individual prediction.
+`docs/architecture.md` · `docs/methodology.md` · `docs/phases.md` (phases 1-6.2 done, Phase 7 deploy next) · `CLAUDE.md` (operating contract).
 
-The methodological bar — point-in-time-correct features, walk-forward validation, isotonic/Platt calibration, market-as-benchmark — is set high deliberately: a tool that misleads its users is worse than no tool at all.
+Built spring 2026. ~500 tests, all quality gates green.
