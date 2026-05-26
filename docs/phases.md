@@ -484,6 +484,39 @@ Average Brier 0.21 vs market 0.20 in Phase 4 masked these tail failures because 
 
 ---
 
+## Phase 4.2 — Surface-specific recovery feature  🟡 design locked, implementation pending
+
+**Entry:** Phase 6.2 + follow-up closed. Top-match accuracy still constrained by structural Elo limits (Djokovic clay frozen, Opelka post-injury, etc.). Phase 4.2 adds two FeatureVector fields (surface-specific days-since-last-match) so LightGBM can learn the staleness pattern empirically — cheaper and lower-risk than full surface-Elo time decay or Glicko-2 conversion.
+
+**Design doc:** `docs/tutorials/phase_4_2_notes.md`. Read before starting.
+
+**Strategy:** Variant A from the "what to do about inverted favourites" conversation. Two features only, no Elo restructuring. If LightGBM doesn't pick up the new signal (validation gate #2 below fails), this becomes a null result and we escalate to Variant B (Elo decay) or Variant C (Glicko-2).
+
+**Deliverables:**
+
+- New `LastMatchPerSurfaceState` class mirroring existing `LastMatchState` (Phase 4.1) but keyed on `(player_id, surface)`.
+- New `last_match_per_surface_state` table.
+- `training_features.schema_version` 2 → 3 with two new columns: `days_since_last_match_surface_p1`, `days_since_last_match_surface_p2` (both nullable, capped 365).
+- `FeatureVector` v3 — 42 fields → 44 fields. Same Pydantic constraints as the existing recovery features.
+- Wire state into `build_training_features` (replay) and `compute_features` (inference); equivalence test must still pass.
+- Leakage tests: tampered-future-row + surface-swap.
+- Re-train 4 production artifacts; v3 metadata.
+
+**Validation gates** (Phase 4.2 doesn't close until all pass):
+
+1. Average Brier on each tour: must not be worse than v2 by > 0.005.
+2. Tail Brier on inactivity-asymmetric subset (one player surface-gap ≥ 180d, other < 30d): v3 must be ≥ 0.01 better than v2.
+3. 10-match acceptance walkthrough — hard rule #12.
+4. `phase_4_2_results.md` written, including SHAP/importance for new features.
+
+**Out of scope:** surface-Elo time decay (Variant B), Glicko-2 (Variant C), market-distillation (rejected on hard rule #3).
+
+**Effort estimate:** ~8-9 hours (~1.5 days).
+
+**Pre-implementation handoff:** at the bottom of `docs/tutorials/phase_4_2_notes.md`.
+
+---
+
 ## Phase 7 — Deployment (Fly.io, fully public)
 
 **Entry:** Phase 6 exit criteria met.
