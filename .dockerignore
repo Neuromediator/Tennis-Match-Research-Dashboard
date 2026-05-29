@@ -1,0 +1,60 @@
+# Mirror of .gitignore + extras that bloat the build context.
+# Anything not needed inside the image should be listed here so it
+# does NOT get sent to the Docker daemon during `docker build`.
+
+# Git
+.git
+.gitignore
+.gitmodules
+.github
+
+# Python caches / virtualenvs
+__pycache__
+*.py[cod]
+*.so
+.Python
+.venv
+venv
+env
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.pyright
+.coverage
+.coverage.*
+htmlcov
+*.egg-info
+build
+dist
+
+# uv local caches
+.uv-cache
+
+# Local editor / IDE
+.idea
+.vscode
+.DS_Store
+
+# Project data — none of this belongs in the image. Sackmann
+# submodules and the DuckDB file are populated on the Fly volume,
+# not baked into the image.
+data
+models
+
+# Local artefacts not needed at runtime.
+# NOTE: README.md is intentionally NOT ignored — pyproject.toml
+# references it via `readme = "README.md"` and hatchling fails the
+# build without it.
+notebooks
+tests
+docs
+CLAUDE.md
+tennis_predictor_bootstrap_prompt.md
+.python-version
+.pre-commit-config.yaml
+.env
+.env.*
+!.env.example
+
+# Claude / agent scratch
+.claude

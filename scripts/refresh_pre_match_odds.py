@@ -23,17 +23,8 @@ import duckdb
 
 from tennis_predictor import config
 from tennis_predictor.data import schema
-from tennis_predictor.data.odds_api import (
-    OddsApiClient,
-    OddsApiError,
-    OddsApiQuotaExceeded,
-    aggregate_events,
-)
-from tennis_predictor.data.pre_match_odds import (
-    check_quota_or_raise,
-    increment_quota,
-    upsert_aggregated,
-)
+from tennis_predictor.data.odds_api import OddsApiQuotaExceeded
+from tennis_predictor.data.odds_refresh import log_ingestion_run, refresh
 
 logger = logging.getLogger(__name__)
 
@@ -42,91 +33,6 @@ def _open_db(path: Path) -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(str(path))
     schema.create_all_tables(conn)
     return conn
-
-
-def _log_ingestion_run(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    run_id: str,
-    started_at: datetime,
-    finished_at: datetime,
-    status: str,
-    rows_added: int,
-    rows_failed: int,
-    requests_used: int,
-    error_message: str | None,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO ingestion_runs (
-            run_id, source, tour, started_at, finished_at, status,
-            rows_added, rows_skipped, rows_failed, requests_used,
-            error_message, notes
-        ) VALUES (?, 'the_odds_api', NULL, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)
-        """,
-        [
-            run_id,
-            started_at.replace(tzinfo=None),
-            finished_at.replace(tzinfo=None),
-            status,
-            rows_added,
-            rows_failed,
-            requests_used,
-            error_message,
-        ],
-    )
-
-
-def refresh(
-    conn: duckdb.DuckDBPyConnection,
-    api_key: str,
-    *,
-    dry_run: bool = False,
-    now: datetime | None = None,
-) -> tuple[int, int]:
-    """Run the refresh end-to-end. Returns (rows_upserted, requests_used).
-
-    On quota exhaustion, bails after the last successful sport_key and
-    surfaces `(rows_so_far, requests_so_far)` so the caller can log a
-    partial run rather than a total failure."""
-    moment = now or datetime.now(UTC)
-    rows_upserted = 0
-    requests_used = 0
-
-    with OddsApiClient(api_key) as client:
-        try:
-            check_quota_or_raise(conn, moment)
-            sports = client.list_active_tennis_sports()
-            requests_used += 1
-            # Discovery is documented as free, but we still increment by
-            # 0 for parity — bookkeeping clarity matters more than a
-            # hypothetical 1-credit difference.
-        except OddsApiQuotaExceeded:
-            raise
-
-        logger.info("active tennis sport keys: %d", len(sports))
-        for sport in sports:
-            try:
-                check_quota_or_raise(conn, moment)
-            except OddsApiQuotaExceeded:
-                logger.warning("quota exhausted mid-run; stopping after %s", sport.key)
-                break
-            try:
-                events = client.fetch_odds(sport.key)
-            except OddsApiError as exc:
-                logger.warning("fetch_odds(%s) failed: %s", sport.key, exc)
-                continue
-            requests_used += 1
-            if not dry_run:
-                increment_quota(conn, 1, moment)
-            aggregated = aggregate_events(events)
-            logger.info(
-                "%s: %d events → %d aggregated rows", sport.key, len(events), len(aggregated)
-            )
-            if not dry_run and aggregated:
-                rows_upserted += upsert_aggregated(conn, aggregated, now=moment)
-
-    return rows_upserted, requests_used
 
 
 def main() -> int:
@@ -177,7 +83,7 @@ def main() -> int:
     finished_at = datetime.now(UTC)
 
     if not args.dry_run:
-        _log_ingestion_run(
+        log_ingestion_run(
             conn,
             run_id=run_id,
             started_at=started_at,

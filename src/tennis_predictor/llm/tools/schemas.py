@@ -72,7 +72,12 @@ NewsCategory = Literal[
 NewsPlayerSubject = Literal["player_a", "player_b", "both"]
 
 # Phase 6.1 — how the LLM agent classifies its news lookup outcome.
-NewsLookupStatus = Literal["ok", "no_results", "failed"]
+NewsLookupStatus = Literal["ok", "no_results", "failed", "budget_exhausted"]
+# Phase 7: `budget_exhausted` is an INTERNAL value never emitted by the
+# LLM. It's set by `_cached_predict` when `DAILY_LLM_BUDGET` is reached
+# and the agent loop is skipped in favour of a direct model-only call.
+# The `submit_analysis` JSON-schema enum in submit.py deliberately
+# excludes it so the LLM can't fabricate this status.
 
 
 # ---------------------------------------------------------------------------

@@ -625,12 +625,23 @@ def recent_form_table_two_column(
 def news_block(response: AgentResponse) -> None:
     """Render the LLM-discovered news items.
 
-    Three states from `response.news_lookup_status`:
+    Four states from `response.news_lookup_status`:
     - `ok` — render the list with [source, date] tags and links.
     - `no_results` — render a one-line "nothing found" message.
     - `failed` — render an "unavailable" message.
+    - `budget_exhausted` (Phase 7) — internal status set by
+      `_cached_predict` when `DAILY_LLM_BUDGET` is reached; the
+      LLM was deliberately skipped and the model probability above
+      came from a direct `get_model_prediction` call.
     """
     st.markdown("### Recent news (last 32 days)")
+    if response.news_lookup_status == "budget_exhausted":
+        st.caption(
+            "⚠ Daily LLM news-lookup budget reached. The news block is paused "
+            "until 00:00 UTC. Model probability, market, surface-Elo, H2H and "
+            "recent-form blocks above are unaffected."
+        )
+        return
     if response.news_lookup_status == "failed":
         st.caption("⚠ News lookup unavailable. Prediction is based on model + DB context only.")
         return
@@ -813,6 +824,36 @@ def player_autocomplete(
 # ---------------------------------------------------------------------------
 
 
+def _budget_exhausted_response(conn: duckdb.DuckDBPyConnection, ctx: MatchContext) -> AgentResponse:
+    """Build a synthetic AgentResponse when the daily LLM budget is
+    reached. Calls `get_model_prediction` directly (no LLM agent loop,
+    no Tavily), returns with empty news and the internal
+    `news_lookup_status='budget_exhausted'` marker so `news_block`
+    can render the right message."""
+    from tennis_predictor.llm.tools.model_tool import get_model_prediction
+    from tennis_predictor.llm.tools.schemas import GetModelPredictionInput
+
+    pred = get_model_prediction(
+        conn,
+        GetModelPredictionInput(
+            player_a_name=ctx.player_a_name,
+            player_b_name=ctx.player_b_name,
+            tour=ctx.tour,
+            surface=ctx.surface,
+            tournament_level=ctx.tournament_level,
+            best_of=ctx.best_of,
+            match_date=ctx.match_date,
+        ),
+    )
+    return AgentResponse(
+        model_probability_player_a=pred.model_probability_player_a,
+        model_probability_player_b=pred.model_probability_player_b,
+        news_items=[],
+        news_lookup_status="budget_exhausted",
+        tools_used=["get_model_prediction"],
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_predict(
     _conn: duckdb.DuckDBPyConnection,
@@ -827,13 +868,30 @@ def _cached_predict(
     tournament_name: str | None,
     scheduled_match_id: str | None,
 ) -> AgentResponse:
-    """Run `TennisAgent.predict` and memoise for 5 minutes (CLAUDE.md Phase 6
-    Step 5 — same TTL as Anthropic's prompt cache so re-clicking the same
-    match doesn't burn another ~$0.10).
+    """Three-layer cached predict.
 
-    The cache key is the tuple of primitive arguments; `_conn` is prefixed
-    with `_` so `st.cache_data` skips hashing it (the connection isn't a
-    value)."""
+    Layer 1 (this `@st.cache_data`): in-memory, per-Streamlit-process,
+    5 min TTL — fast path inside a single visit.
+
+    Layer 2 (DuckDB `prediction_cache`): cross-session, 24h TTL, shared
+    by all visitors, survives Machine restarts. Only used for scheduled
+    fixtures (`scheduled_match_id is not None`); Custom predictions skip
+    Layer 2 and rely on Layer 1 only.
+
+    Layer 3 (`DAILY_LLM_BUDGET` cap): before invoking the LLM agent,
+    check `today_trace_count()` against the daily budget. If exhausted,
+    skip the LLM and return a model-only AgentResponse (no news block,
+    page still renders all deterministic blocks). The budget-exhausted
+    response is NOT written to Layer 2 — the cap resets at 00:00 UTC
+    and the next-day visitor should get a real news lookup."""
+    from tennis_predictor.data import prediction_cache
+    from tennis_predictor.llm import budget
+
+    if scheduled_match_id is not None:
+        hit = prediction_cache.get_cached(_conn, scheduled_match_id)
+        if hit is not None:
+            return hit
+
     ctx = MatchContext(
         tour=tour,
         player_a_name=player_a_name,
@@ -845,8 +903,17 @@ def _cached_predict(
         tournament_name=tournament_name,
         scheduled_match_id=scheduled_match_id,
     )
+
+    if budget.is_budget_exhausted(_conn):
+        return _budget_exhausted_response(_conn, ctx)
+
     agent = TennisAgent(_conn)
-    return asyncio.run(agent.predict(ctx))
+    response = asyncio.run(agent.predict(ctx))
+
+    if scheduled_match_id is not None:
+        prediction_cache.store(_conn, scheduled_match_id, response)
+
+    return response
 
 
 def run_and_render_prediction(conn: duckdb.DuckDBPyConnection, ctx: MatchContext) -> None:
@@ -966,7 +1033,21 @@ def recent_predictions_scoreboard(conn: duckdb.DuckDBPyConnection, *, limit: int
             }
         )
 
-    st.dataframe(output_rows, use_container_width=True, hide_index=True)
+    st.dataframe(
+        output_rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ts": st.column_config.TextColumn("Time", width="small"),
+            "tour": st.column_config.TextColumn("Tour", width="small"),
+            "match": st.column_config.TextColumn("Match", width="large"),
+            "surface": st.column_config.TextColumn("Surface", width="small"),
+            "model %": st.column_config.TextColumn("Model", width="small"),
+            "market %": st.column_config.TextColumn("Market", width="small"),
+            "gap (model - market)": st.column_config.TextColumn("Δ pp", width="small"),
+            "market source": st.column_config.TextColumn("Src", width="small"),
+        },
+    )
 
 
 def odds_api_quota_block(conn: duckdb.DuckDBPyConnection) -> None:

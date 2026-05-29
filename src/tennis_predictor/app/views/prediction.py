@@ -14,7 +14,6 @@ deterministically alongside.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import streamlit as st
@@ -48,7 +47,6 @@ from tennis_predictor.data.reconcile import AliasIndex
 from tennis_predictor.llm.agent import (
     AgentError,
     BudgetExceededError,
-    TennisAgent,
 )
 from tennis_predictor.llm.tools.db_tools import get_surface_elo
 from tennis_predictor.llm.tools.schemas import (
@@ -126,18 +124,32 @@ def _render_match_time(conn, ctx: MatchContext) -> None:
 
 
 def _run_agent(conn, ctx: MatchContext):
-    """Run the agent loop once and return the AgentResponse. Maps the
-    documented failure modes to user-visible warnings.
+    """Run a prediction via the three-layer cache (`_cached_predict`) so
+    cross-session repeats hit Layer 2 (DuckDB `prediction_cache`, 24h
+    TTL) instead of re-invoking the LLM agent. Maps the documented
+    failure modes to user-visible warnings.
 
-    The `st.spinner` is critical UX: the agent loop takes 15-40 seconds
-    (model inference + 2-3 LLM iterations + Tavily fan-out), and without
-    a spinner the user sees a frozen page and assumes the click was
-    lost. Streamlit's spinner stays visible until the wrapped block
-    returns, which is exactly what we need."""
+    The `st.spinner` is critical UX: a cold-path prediction takes 15-40
+    seconds (model inference + 2-3 LLM iterations + Tavily fan-out),
+    and without a spinner the user sees a frozen page and assumes the
+    click was lost. A cache hit returns instantly so the spinner barely
+    flashes."""
+    from tennis_predictor.app.widgets import _cached_predict
+
     try:
         with st.spinner("Running model + LLM news lookup… (~20-40s)"):
-            agent = TennisAgent(conn)
-            return asyncio.run(agent.predict(ctx))
+            return _cached_predict(
+                conn,
+                tour=ctx.tour,
+                player_a_name=ctx.player_a_name,
+                player_b_name=ctx.player_b_name,
+                surface=ctx.surface,
+                tournament_level=ctx.tournament_level,
+                best_of=ctx.best_of,
+                match_date=ctx.match_date,
+                tournament_name=ctx.tournament_name,
+                scheduled_match_id=ctx.scheduled_match_id,
+            )
     except ModelUnavailableError as exc:
         st.error(f"Model artifact not loaded — prediction cannot run. ({exc})")
         return None

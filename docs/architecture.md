@@ -1,78 +1,139 @@
 # Architecture
 
-A single-process Python application with five logical layers. No microservices. One DuckDB file is the system of record.
+A single-process Python application with five logical layers and one DuckDB file as the system of record. No microservices, no message queue, no separate model server.
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ Interface layer (Streamlit) — Phase 6.2: research dashboard        │
-│   - Home (upcoming matches)                                        │
-│   - Match dashboard: comparison row (market / model / surface-Elo) │
-│     + "why model differs" panel when gap > 10pp + H2H detail +     │
-│     two-column recent form + LLM-discovered news                   │
-│   - Custom match (3-input form with player autocomplete)           │
-│   - Model evaluation (calibration plots, llm_traces, costs,        │
-│     last-20 model-vs-market gaps scoreboard)                       │
+│ Interface (Streamlit)                                              │
+│   - Home                — upcoming matches, tour filter, date-only │
+│   - Match dashboard     — signal comparison (market / model /      │
+│                           surface-Elo) + "why model differs"       │
+│                           panel + H2H + recent form + news block   │
+│   - Custom match        — 3-input what-if form                     │
+│   - Model evaluation    — calibration plots, scoreboard, quotas,   │
+│                           cost monitor, llm_traces                 │
 └────────────────────┬───────────────────────────────────────────────┘
                      │
 ┌────────────────────▼───────────────────────────────────────────────┐
-│ LLM agent layer (Phase 6.1 scope)                                  │
-│   - LLMClient (Anthropic) with prompt caching + llm_traces logging │
-│   - LLM tools: get_model_prediction (mandatory) /                  │
-│     get_head_to_head (detailed) / get_surface_elo / web_search /   │
-│     submit_analysis                                                │
-│   - View-layer helpers (NOT LLM tools): fetch_recent_n_matches,    │
-│     fetch_pre_match_odds (Phase 6.2)                               │
-│   - Structured output: AgentResponse = news_items + status only.   │
-│     No narrative, no caveats, no confidence_band — every shown     │
-│     fact carries source+date as adjacent UI metadata.              │
+│ LLM agent                                                          │
+│   - LLMClient (Anthropic SDK direct)                               │
+│   - Prompt caching with byte-stable cacheable prefix               │
+│   - Bounded budget: 4 iter / 30k tok / 120s / 2 web searches       │
+│   - Tools: get_model_prediction, get_head_to_head, get_surface_elo,│
+│            web_search (Tavily), submit_analysis                    │
+│   - Output: news_items (typed, dated, categorised) + status enum.  │
+│     No narrative, no confidence_band — view layer renders details. │
+│   - Every call logged to llm_traces                                │
 └──────────┬─────────────────────────────────┬───────────────────────┘
            │                                 │
 ┌──────────▼──────────────┐    ┌─────────────▼──────────────────────┐
-│ Modeling layer          │    │ Feature engineering layer          │
-│   - Four models         │    │   - build_training_features()      │
-│     (2 types × 2 tours: │    │     (chronological replay + state) │
-│     Elo / LightGBM)     │    │   - compute_features(...)          │
-│   - Walk-forward CV     │    │     (inference, returns            │
-│   - Isotonic / Platt    │    │     FeatureVector v2 — 39 fields)  │
-│   - Market benchmark    │    │                                    │
+│ Modeling                │    │ Feature engineering                │
+│   - 4 trained artifacts │    │   - build_training_features()      │
+│     (ATP/WTA × Elo /    │    │     (chronological replay)         │
+│     LightGBM)           │    │   - compute_features(...)          │
+│   - Walk-forward CV     │    │     → FeatureVector (44 fields)    │
+│   - Isotonic / Platt    │    │   - State objects: EloState,       │
+│   - Market overlay on   │    │     LastMatchState,                │
+│     every report        │    │     LastMatchPerSurfaceState, etc. │
 └──────────┬──────────────┘    └─────────────┬──────────────────────┘
            │                                 │
 ┌──────────▼─────────────────────────────────▼──────────────────────┐
-│ Data layer (DuckDB, single file)                                  │
-│   matches, scheduled_matches, players, rankings, player_aliases,  │
-│   market_implied_probabilities, elo_state, last_match_state,      │
-│   training_features, llm_traces, ingestion_runs,                  │
-│   matchstat_player_recent_cache, matchstat_h2h_cache,             │
-│   matchstat_quota, pre_match_odds (Phase 6.2)                     │
+│ Data layer — DuckDB (single file)                                 │
+│   matches            scheduled_matches    players                 │
+│   rankings           player_aliases       market_implied_probs    │
+│   elo_state          last_match_state     last_match_per_surface  │
+│   training_features  llm_traces           ingestion_runs          │
+│   matchstat_*_cache  matchstat_quota      pre_match_odds          │
+│   odds_api_quota     prediction_log                               │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Data sources
 
-- **Cold:** Jeff Sackmann's `tennis_atp` and `tennis_wta` repos as git submodules. Used for both prediction targets (tour-level singles) and feature computation (Challengers/Futures contribute to ratings but not to training labels).
-- **Hot:** matchstat Tennis API ("Tennis API - ATP WTA ITF" on RapidAPI), free tier 500 req/month. Three responsibilities: (a) currently-known upcoming fixtures into `scheduled_matches` — in tennis this is whatever the draw has surfaced so far (full R1 right after a draw, then today/tomorrow's matches as the bracket resolves), this is what the product lets users predict against, (b) inter-week ranking overlay between weekly Sackmann snapshots, (c) **Phase 6.1: on-demand per-player past-matches + H2H** via `/atp/player/past-matches/{id}` and `/atp/h2h/matches/{a}/{b}` (the correct H2H endpoint per `tennisapidoc.matchstat.com/h2h` — Phase 6.1 wrongly used `/atp/fixtures/h2h/{a}/{b}` which returns upcoming fixtures, fix scheduled in Phase 6.2 Step 4.1), used to show the user fresh "last 8 matches" + detailed H2H on the Prediction page. Cached 24h in `matchstat_player_recent_cache` / `matchstat_h2h_cache`; quota tracked in `matchstat_quota` with a 480/500 graceful-fallback threshold. Completed matches in bulk (full-tournament `tournament/results`) still do NOT come from matchstat — its `calendar/{year}` is forward-only and silently drops currently-active tournaments. Sackmann (cold) remains the source of truth for the training matches table; the on-demand path only enriches the per-prediction view layer. Daily refresh logs to `ingestion_runs`.
-- **Live market odds (Phase 6.2):** The Odds API (`the-odds-api.com`), free tier 500 credits/month. Per-tournament tennis sport keys (`tennis_atp_french_open`, `tennis_wta_madrid`, etc.) discovered daily via `GET /v4/sports/?all=false`, then odds fetched per active key with `regions=eu&markets=h2h&oddsFormat=decimal`. Persisted to `pre_match_odds` table with both median-across-books and Pinnacle-specific columns. Daily batch via `scripts/refresh_pre_match_odds.py` (~120-180 credits/month) plus lazy 24h refresh on Prediction-page load (~30 credits/month). Not used as a training feature (hard rule #3); rendered in the dashboard's comparison row alongside the model's probability.
-- **Historical benchmark:** tennis-data.co.uk archives provide closing-price implied probabilities. Loaded into `market_implied_probabilities`. **Not a feature.** Used for Phase 4 calibration reports (model Brier vs market Brier on historical walk-forward folds).
+| Source | Role | Refresh cadence | Quota |
+|---|---|---|---|
+| **Sackmann** (`tennis_atp` / `tennis_wta` git submodules) | Historical match record. Source of truth for `matches`, used to train the model and feed Elo state. | Weekly (git pull). | Free, no rate limit. |
+| **matchstat** (RapidAPI) | Upcoming fixtures, current rankings, on-demand H2H + per-player past matches for the prediction view. | Daily evening UTC + lazy per-prediction. | 500 req/calendar month free. |
+| **The Odds API** | Pre-match h2h odds for active tour-level tournaments. Aggregated to median + Pinnacle subtitle. | Daily + lazy refresh on Prediction-page load when cache > 24h old. | 500 credits/calendar month free. |
+| **tennis-data.co.uk** | Historical closing-price implied probabilities. Calibration benchmark on training reports — not a feature. | Same orchestrator as Sackmann. | Free, manual download. |
+| **Anthropic** | LLM agent (news discovery + categorisation). | Per Match-dashboard render (cached in `st.session_state` after first run). | $20/month workspace cap. |
+| **Tavily** | News-snippet search. Called from inside the agent's `web_search` tool. | Per agent call (max 2 searches each). | 1000 searches/month free. |
+
+## Module layout
+
+```
+src/tennis_predictor/
+├── app/                    Streamlit interface
+│   ├── main.py             entry point + sidebar
+│   ├── views/              one file per page
+│   ├── widgets.py          shared widgets (cost monitor, quota blocks, etc.)
+│   ├── context.py          MatchContext builders (from scheduled / freeform)
+│   ├── db.py               session-scoped DuckDB connection
+│   └── why_differs.py      6 deterministic rules + generic fallback
+├── data/
+│   ├── ingest_sackmann.py  cold-layer ingestion
+│   ├── load_market.py      tennis-data.co.uk loader
+│   ├── matchstat.py        matchstat API client (typed)
+│   ├── matchstat_live.py   on-demand fetcher with 24h DuckDB cache
+│   ├── odds_api.py         The Odds API client + aggregator
+│   ├── odds_fallback.py    Tavily-regex odds extraction
+│   ├── pre_match_odds.py   persistence + name reconciliation
+│   ├── recent_form_live.py view-layer H2H + last-N helpers
+│   ├── load_hot.py         scheduled_matches / rankings persistence
+│   ├── refresh_hot.py      daily orchestrator + 4 prune passes
+│   ├── reconcile.py        AliasIndex + fuzzy resolution
+│   └── schema.py           DDL + idempotent migrations
+├── features/               build_training_features + compute_features
+├── models/                 walk-forward, calibration, artifact I/O
+├── llm/
+│   ├── client.py           LLMClient ABC + AnthropicLLMClient
+│   ├── agent.py            TennisAgent.predict + AgentBudget
+│   ├── prompts.py          system prompt (byte-stable)
+│   ├── tools/              per-tool input/output schemas + dispatch
+│   └── cost.py             pricing + cache hit rate
+└── config.py               env vars, paths, model defaults
+```
+
+```
+scripts/
+├── refresh_data.py             — cold layer (Sackmann + market)
+├── refresh_hot.py              — matchstat fixtures + rankings (daily)
+├── refresh_pre_match_odds.py   — The Odds API (daily + lazy)
+├── apply_aliases_review.py     — promote manual-review CSV
+├── find_duplicate_players.py   — Sackmann same-name-same-DOB detection
+├── apply_player_dedupe.py      — repoint stale IDs → canonical
+├── build_features.py           — training_features rebuild
+├── train_models.py             — 4 production artifacts
+├── predict_match.py            — CLI prediction
+└── clear_scheduled_matches.py  — one-off reset utility
+```
 
 ## Cross-cutting concerns
 
-- **Provenance.** Every match row carries `source` and `match_external_id`.
-- **Player ID reconciliation.** A single canonical `player_id` per player. All non-canonical names map via `player_aliases` (with `source` distinguishing how the alias got there: `sackmann` seeded, `manual_review` approved by a human, hot-API source later). Ambiguous fuzzy matches go to `data/processed/aliases_review.csv` for manual review; `scripts/apply_aliases_review.py` promotes approved decisions back to `player_aliases`.
-- **Audit trail.** Two append-only CSVs under `data/processed/` survive every refresh: `aliases_review.csv` (low-confidence resolutions) and `unmatched_market_rows.csv` (resolved names that didn't join a match row). The first feeds the manual-review loop; the second is a debugging signal explored in `notebooks/explore_unmatched.ipynb`.
-- **Point-in-time correctness.** Enforced by tests, not by convention. The feature layer is the only sanctioned source of feature values.
-- **Observability.** Every LLM call is logged to `llm_traces` with token counts, cache stats, latency, and tool-call sequence.
-- **Configuration.** All paths and env vars flow through `src/tennis_predictor/config.py`. `DATA_DIR` resolves both local dev and containerized deployment.
+- **Provenance** — every match row carries `source` + `match_external_id`.
+- **Player ID reconciliation** — one canonical `player_id` per player, aliases tracked in `player_aliases` with `source` annotated. Same-name-same-DOB Sackmann duplicates are surfaced and merged via the dedupe scripts.
+- **Audit artefacts** — `aliases_review.csv` (low-confidence resolutions awaiting human verdict) and `duplicate_players_review.csv` (Sackmann roster dedupe candidates) live under `data/processed/`. Both are append-only / regenerable.
+- **Point-in-time correctness** — enforced by `tests/test_feature_leakage.py`. A tampered future row may not change any earlier feature value.
+- **Observability** — every LLM call logged to `llm_traces` (tokens, cache stats, cost, latency, tool sequence). Every refresh logged to `ingestion_runs` (rows added/skipped/failed, requests_used, status).
+- **Configuration** — all paths and env vars flow through `src/tennis_predictor/config.py`. Resolves both local dev and containerised deploy.
 
 ## Deployment shape
 
-- Local dev: `uv run streamlit run ...`. DuckDB file at `data/processed/tennis.duckdb`.
-- Containerized (phase 7): single Dockerfile. DuckDB file mounted from a volume. The container is stateless except for that volume.
-- Target: Fly.io (locked in Phase 7 design — see `docs/phases.md`). Public URL, no auth gate; budget protection via per-IP rate limit + hard daily $ cap.
+- **Local dev:** `uv run streamlit run src/tennis_predictor/app/main.py`. DuckDB at `data/processed/tennis.duckdb`.
+- **Production:** **Fly.io**, single Machine, single DuckDB file on a 5 GB persistent volume mounted at `/data`. Live at https://tennis-research-dashboard.fly.dev/.
+  - One Dockerfile, two-stage build (`python:3.12-slim` + uv), ~270 MB image.
+  - `shared-cpu-1x` / 2 GB RAM (1 GB OOMs under DuckDB + LightGBM + render load).
+  - Daily refresh runs **in-process** via APScheduler (`app/scheduler.py`) on a background thread — DuckDB does not support multi-process writes, so a separate cron Machine would deadlock on the file lock.
+  - Three-layer prediction cache: `st.session_state` (per-tab) → `@st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table (cross-session, 24 h). Repeat clicks on the same fixture cost $0.
+  - Global daily LLM trace cap (`DAILY_LLM_BUDGET=60`) caps Anthropic spend at ≈ $1-2/day.
+  - Secrets via `fly secrets set`: `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`.
+  - Non-secret env (in `fly.toml`): `ENABLE_SCHEDULER=true`, `REFRESH_HOUR_UTC=21`, `MODELS_DIR=/data/models`.
+  - Bootstrap: see `docs/phase7_plan.md`. `tennis.duckdb` and `models/` are built locally and uploaded via `fly ssh sftp put` — Fly's shared CPU is too slow for full `build_features.py` / `train_models.py`.
+  - Cold (Sackmann) updates are **manual** (`fly machine stop` → `fly ssh console` → `git pull` + `refresh_data.py --skip-submodules` → `fly machine start`). Daily/odds run automatically.
 
-## What is intentionally absent
+## What's intentionally absent
 
-- No microservices, no message queue, no Redis.
-- No model server (predictions run in-process).
-- No user accounts / sessions / multi-user state.
-- No realtime data path; all ingestion is batch.
-- No managed Postgres; DuckDB is sufficient at this scale.
+- No microservices, no message queue, no Redis, no managed Postgres.
+- No model server — predictions run in-process via `joblib.load`.
+- No user accounts, no session storage beyond Streamlit's per-tab state.
+- No realtime data path — all ingestion is batch.

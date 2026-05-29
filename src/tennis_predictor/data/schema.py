@@ -354,6 +354,19 @@ CREATE TABLE IF NOT EXISTS prediction_log (
 );
 """
 
+# Phase 7: 24h persistent cache of `AgentResponse` keyed by
+# `scheduled_match_id`. Repeat clicks on the same Match dashboard
+# within 24h read from here instead of re-invoking the LLM agent
+# (~$0.10/call). Only scheduled fixtures are cached — free-form
+# Custom predictions rely on Streamlit's in-memory `@st.cache_data`.
+PREDICTION_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS prediction_cache (
+    scheduled_match_id    VARCHAR PRIMARY KEY,
+    cached_at             TIMESTAMP NOT NULL,
+    agent_response_json   VARCHAR NOT NULL
+);
+"""
+
 # One row per refresh execution against any source. Drives the
 # "data is N hours stale" warning in the UI and tracks per-source
 # request usage against quota caps.
@@ -502,6 +515,7 @@ TABLE_DDL: list[str] = [
     ODDS_API_QUOTA_DDL,
     PREDICTION_LOG_SEQUENCE_DDL,
     PREDICTION_LOG_DDL,
+    PREDICTION_CACHE_DDL,
 ]
 
 EXPECTED_TABLES: frozenset[str] = frozenset(
@@ -524,6 +538,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "pre_match_odds",
         "odds_api_quota",
         "prediction_log",
+        "prediction_cache",
     }
 )
 

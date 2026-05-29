@@ -19,6 +19,7 @@ dependencies = [
     "matplotlib>=3.9.0",
     "openpyxl>=3.1.5",
     "httpx>=0.28.1",
+    "apscheduler>=3.11.2",
 ]
 
 [dependency-groups]

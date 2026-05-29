@@ -16,10 +16,21 @@ DB calls are guarded with their own try/except.
 
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
 
 from tennis_predictor.app.db import DuckDBLockError, get_connection
+from tennis_predictor.app.scheduler import get_scheduler
 from tennis_predictor.app.widgets import cost_footer, freshness_indicator
+
+# Configure root logging so [scheduler] / [refresh_jobs] INFO messages
+# land in `fly logs`. Streamlit otherwise leaves third-party loggers at
+# the Python default (WARNING) and we lose the daily-refresh trail.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 st.set_page_config(
     page_title="Tennis match research dashboard",
@@ -81,6 +92,11 @@ def _footer() -> None:
     except Exception:
         return
 
+
+# Start the daily-refresh scheduler if ENABLE_SCHEDULER is on. Cached
+# via @st.cache_resource — fires exactly once per process, no-op on
+# subsequent script reruns. Returns None when gated off (local dev).
+get_scheduler()
 
 _sidebar()
 navigation.run()
