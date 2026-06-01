@@ -138,7 +138,10 @@ else:
                 player2_name,
                 scheduled_start_utc,
             ) in group:
-                cols = st.columns([4, 2, 3, 1])
+                # Button column kept wide enough that "Predict" never
+                # wraps to two lines at mid-width viewports (~1920px with
+                # the sidebar open); a 1/10 share was too narrow there.
+                cols = st.columns([4, 2, 3, 2])
                 cols[0].write(f"**{player1_name}** vs **{player2_name}**")
                 cols[1].write(round_name or "—")
                 # Phase 6.2 follow-up: render DATE only, no start time.
