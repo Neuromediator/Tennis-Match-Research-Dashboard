@@ -137,7 +137,7 @@ def _run_agent(conn, ctx: MatchContext):
     from tennis_predictor.app.widgets import _cached_predict
 
     try:
-        with st.spinner("Running model + LLM news lookup… (~20-40s)"):
+        with st.spinner("Running model + LLM news lookup… (~40-80s)"):
             return _cached_predict(
                 conn,
                 tour=ctx.tour,

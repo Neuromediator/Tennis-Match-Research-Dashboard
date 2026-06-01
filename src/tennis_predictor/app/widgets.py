@@ -921,7 +921,7 @@ def run_and_render_prediction(conn: duckdb.DuckDBPyConnection, ctx: MatchContext
     documented failure surface (CLAUDE.md "LLM agent failure modes") to a
     user-friendly message instead of a Python traceback in the browser."""
     try:
-        with st.spinner("Running model + LLM analyst…"):
+        with st.spinner("Running model + LLM analyst… (~40-80s)"):
             response = _cached_predict(
                 conn,
                 tour=ctx.tour,
