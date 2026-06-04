@@ -65,3 +65,4 @@ notebooks/_*.ipynb
 
 # OS
 Thumbs.db
+models_hf_upload/
