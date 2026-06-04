@@ -53,12 +53,21 @@ CI runs the same four. Pre-commit hook runs `ruff` + `nbstripout`.
 
 | Source | Free tier | What our counter shows |
 |---|---|---|
-| matchstat | 500 req / calendar month | SUM of `ingestion_runs.requests_used` (hot refresh, ~13-15/run) + `matchstat_quota.requests_used` (per-prediction H2H/past-matches) |
+| matchstat | 500 req / month | SUM of `ingestion_runs.requests_used` (hot refresh, ~13-15/run) + `matchstat_quota.requests_used` (per-prediction H2H/past-matches) |
 | The Odds API | 500 credits / calendar month | `odds_api_quota.requests_used` — only billable `/sports/{key}/odds` calls (discovery is free per docs) |
 | Anthropic | $20/month workspace cap (set in console) | `llm_traces.estimated_cost_usd` aggregated daily/monthly |
 | Tavily | 1000 searches / month | Counted via `llm_traces.web_search_count` |
 
-Both monthly counters reset on the 1st (UTC).
+**Quota reset cadence is NOT uniform.** matchstat (RapidAPI) resets on the
+**subscription billing cycle**, not the calendar 1st — for this account the
+cycle started 2026-05-18, so the monthly window rolls over ~the 18th. The
+daily hot refresh alone is ~13-15 req × 30 ≈ 450/month, i.e. it nearly
+exhausts the 500 free tier on its own; per-prediction H2H/past-matches
+calls eat the rest. When the limit is hit, every matchstat call returns
+HTTP 429 and the hot refresh fails on its first request — surfaced in the
+UI as "matchstat monthly quota exhausted (429)" (see `app/widgets.py`
+`is_quota_error`). The Odds API / Anthropic / Tavily counters reset on the
+calendar 1st (UTC).
 
 ## Where to find things
 

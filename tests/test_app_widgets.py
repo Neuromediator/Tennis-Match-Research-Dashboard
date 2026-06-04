@@ -19,8 +19,10 @@ import pytest
 from tennis_predictor.app.widgets import (
     STALE_THRESHOLD_HOURS,
     is_data_stale,
+    is_quota_error,
     query_cost_summary,
     query_last_hot_refresh,
+    query_last_hot_run_error,
     query_matchstat_usage_month,
 )
 from tennis_predictor.data import schema
@@ -300,3 +302,86 @@ def test_query_matchstat_usage_empty_returns_zero(conn: duckdb.DuckDBPyConnectio
     used, cap = query_matchstat_usage_month(conn, now=now)
     assert used == 0
     assert cap == 500
+
+
+# ---------------------------------------------------------------------------
+# Quota-exhaustion (429) detection
+# ---------------------------------------------------------------------------
+
+
+def _insert_run_with_error(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    started_at: datetime,
+    status: str,
+    error_message: str | None,
+    source: str = "matchstat",
+) -> None:
+    conn.execute(
+        "INSERT INTO ingestion_runs (run_id, source, tour, started_at, status, "
+        "rows_added, rows_skipped, rows_failed, requests_used, error_message, notes) "
+        "VALUES (?, ?, NULL, ?, ?, 0, 0, 0, 1, ?, NULL)",
+        [f"run-{started_at.isoformat()}", source, started_at, status, error_message],
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("MatchstatError: matchstat 429 at /atp/...: Too Many Requests", True),
+        ("matchstat 429 at /wta/tournament/calendar/2026", True),
+        ("Some Too Many Requests body", True),
+        ("MatchstatError: matchstat 500 at /atp/...", False),
+        ("ConnectionError: timed out", False),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_is_quota_error(message: str | None, expected: bool) -> None:
+    assert is_quota_error(message) is expected
+
+
+def test_query_last_hot_run_error_returns_message_when_latest_failed(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert_run_with_error(
+        conn,
+        started_at=datetime(2026, 6, 3, 21, 0),
+        status="failed",
+        error_message="MatchstatError: matchstat 429 at /atp/...",
+    )
+    err = query_last_hot_run_error(conn)
+    assert err is not None
+    assert is_quota_error(err) is True
+
+
+def test_query_last_hot_run_error_none_when_latest_succeeded(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    # An older failure followed by a newer success → resolved, no error.
+    _insert_run_with_error(
+        conn,
+        started_at=datetime(2026, 6, 3, 21, 0),
+        status="failed",
+        error_message="MatchstatError: matchstat 429 ...",
+    )
+    _insert_run_with_error(
+        conn,
+        started_at=datetime(2026, 6, 4, 21, 0),
+        status="partial",
+        error_message=None,
+    )
+    assert query_last_hot_run_error(conn) is None
+
+
+def test_query_last_hot_run_error_ignores_other_sources(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert_run_with_error(
+        conn,
+        started_at=datetime(2026, 6, 4, 21, 0),
+        status="failed",
+        error_message="odds api 429",
+        source="the_odds_api",
+    )
+    assert query_last_hot_run_error(conn, source="matchstat") is None

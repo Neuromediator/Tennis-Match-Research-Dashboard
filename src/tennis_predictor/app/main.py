@@ -21,7 +21,7 @@ import logging
 import streamlit as st
 
 from tennis_predictor.app.db import DuckDBLockError, get_connection
-from tennis_predictor.app.scheduler import get_scheduler
+from tennis_predictor.app.scheduler import get_scheduler, maybe_catch_up_refresh
 from tennis_predictor.app.widgets import cost_footer, freshness_indicator
 
 # Configure root logging so [scheduler] / [refresh_jobs] INFO messages
@@ -96,7 +96,13 @@ def _footer() -> None:
 # Start the daily-refresh scheduler if ENABLE_SCHEDULER is on. Cached
 # via @st.cache_resource — fires exactly once per process, no-op on
 # subsequent script reruns. Returns None when gated off (local dev).
-get_scheduler()
+_scheduler = get_scheduler()
+
+# Catch-up-on-wake: on a host that sleeps when idle (HF Spaces), the
+# 21:00 cron cannot fire while asleep, so the first visit after a wake
+# triggers a background refresh if the hot data is stale. Runs at most
+# once per process and never blocks the render. No-op when gated off.
+maybe_catch_up_refresh(_scheduler)
 
 _sidebar()
 navigation.run()

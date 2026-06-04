@@ -233,6 +233,46 @@ def query_last_hot_refresh(
     return last
 
 
+def query_last_hot_run_error(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: str = "matchstat",
+) -> str | None:
+    """`error_message` of the most recent `ingestion_runs` row for `source`
+    if that latest run *failed*, else None.
+
+    Used to distinguish "stale because the last refresh hit the matchstat
+    monthly quota (429)" from a generic staleness. Only the latest row is
+    considered: a `success`/`partial` newer than any failure means the
+    failure is resolved."""
+    row = conn.execute(
+        """
+        SELECT status, error_message
+        FROM ingestion_runs
+        WHERE source = ?
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        [source],
+    ).fetchone()
+    if row is None:
+        return None
+    status, error_message = row
+    if status != "failed":
+        return None
+    return error_message
+
+
+def is_quota_error(error_message: str | None) -> bool:
+    """True when an `ingestion_runs.error_message` indicates an exhausted
+    API quota (HTTP 429). matchstat (RapidAPI) returns 429 on every call
+    once the monthly request limit is reached."""
+    if not error_message:
+        return False
+    text = error_message.lower()
+    return "429" in text or "too many requests" in text
+
+
 def is_data_stale(
     last_refresh: datetime | None,
     *,
@@ -267,6 +307,14 @@ def stale_data_banner(conn: duckdb.DuckDBPyConnection) -> None:
         return
     age = now - last
     hours = age.total_seconds() / 3600
+    if is_quota_error(query_last_hot_run_error(conn)):
+        st.warning(
+            f"matchstat monthly quota exhausted (HTTP 429) — fixture refresh "
+            f"paused until the RapidAPI billing cycle resets. Showing data as "
+            f"of the last successful refresh ({last.strftime('%Y-%m-%d %H:%M UTC')}, "
+            f"{hours:.0f}h ago)."
+        )
+        return
     st.warning(
         f"Data is {hours:.0f} hours stale — last successful refresh: "
         f"{last.strftime('%Y-%m-%d %H:%M UTC')}."
