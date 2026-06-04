@@ -40,6 +40,10 @@ data/processed/*
 # Model artifacts (root-level only — src/tennis_predictor/models/ is the Python package)
 /models/
 
+# DuckDB snapshots pulled for HF bootstrap (never commit the 1.3 GB DB)
+*.duckdb
+*.duckdb.wal
+
 # Notebooks: tracked, but outputs stripped by pre-commit
 # (no ignore needed; nbstripout handles it)
 
