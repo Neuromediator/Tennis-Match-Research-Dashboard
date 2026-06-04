@@ -60,6 +60,8 @@ COPY --from=builder /app/src /app/src
 COPY --from=builder /app/scripts /app/scripts
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
 
+RUN chmod +x /app/scripts/docker-entrypoint.sh
+
 # Persistent volume mount point (see fly.toml [mounts]).
 # DuckDB, Sackmann submodules, model artifacts all live here.
 ENV DATA_DIR=/data \
@@ -76,6 +78,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 EXPOSE 8080
 
-# Default process is the Streamlit app. The cron Machine in fly.toml
-# overrides this with `python scripts/refresh_hot.py`.
+# Entrypoint bootstraps the persistent volume (no-op once populated / off
+# HF) then execs the CMD. CMD is the Streamlit app; it can be overridden
+# (e.g. `python scripts/refresh_hot.py`) and still runs through bootstrap.
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["streamlit", "run", "src/tennis_predictor/app/main.py"]

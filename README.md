@@ -1,3 +1,16 @@
+---
+title: Tennis Match Research Dashboard
+emoji: 🎾
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 8080
+pinned: false
+---
+
+<!-- The YAML block above is Hugging Face Space metadata (Docker SDK),
+     required by HF Spaces and rendered as a table by GitHub. -->
+
 # Tennis Match Research Dashboard
 
 **Production-grade LLM agent engineering on a real domain.** The dashboard renders four independent signals side by side for every upcoming ATP / WTA tour-level singles match — market consensus odds, a trained LightGBM probability, a surface-Elo baseline, an LLM-discovered news block — plus a deterministic *"why model differs"* panel whenever the model-vs-market gap exceeds 10pp. The purpose of project is to demonstrate end-to-end ML+LLM engineering: data ingestion, feature engineering, model training, evaluation, LLM tool-calling integration, deployable interface. **Not a betting tool.**
