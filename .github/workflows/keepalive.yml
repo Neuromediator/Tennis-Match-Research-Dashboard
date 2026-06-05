@@ -1,0 +1,45 @@
+name: Keep HF Space warm
+
+# The dashboard runs on a free Hugging Face Space (CPU basic), which sleeps
+# after 48h of no HTTP traffic. Without persistent storage, a cold start
+# re-downloads the 1.3 GB DuckDB snapshot — slow for the first visitor.
+# This workflow pings the Space URL on a schedule so the container stays
+# warm: the in-memory DB + prediction cache persist and the daily 21:00 UTC
+# refresh runs. A wake (after an involuntary reset) is handled by the app's
+# bootstrap + catch-up-on-wake; the retry loop below tolerates a slow wake.
+#
+# Note: GitHub disables scheduled workflows after 60 days of repo inactivity.
+# If that happens the Space simply goes back to sleeping (cold start on the
+# next visit) — no data loss, just a slower first load.
+
+on:
+  schedule:
+    # Twice daily (UTC) — a safety margin against the 48h sleep window and
+    # GitHub's well-known scheduled-cron lag/skips. A single missed run then
+    # never risks crossing 48h.
+    - cron: "0 6,18 * * *"
+  workflow_dispatch: {}
+
+# Don't pile up runs if one is slow; a newer ping supersedes an older one.
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the Space URL until it responds
+        env:
+          SPACE_URL: https://neuromediator-tennis-research-dashboard.hf.space/
+        run: |
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" -L --max-time 150 "$SPACE_URL" || echo "000")
+            echo "attempt $attempt -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Space is awake."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::warning::Space did not return 200 after retries (may still be waking)."
