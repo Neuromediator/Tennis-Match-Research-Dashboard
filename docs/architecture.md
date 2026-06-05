@@ -132,6 +132,44 @@ scripts/
   - Cold (Sackmann) updates are **manual**: rebuild the DuckDB locally (`refresh_data.py` + `build_features.py` + `train_models.py`) and re-upload to the dataset. Daily/odds run automatically while warm.
   - Prior Fly.io deployment (single Machine + volume) kept as history in `docs/phases.md` Phase 7 / `docs/phase7_plan.md`; the migration is Phase 8.
 
+### Manual cold-data (Sackmann) refresh
+
+Hot data (fixtures, rankings, odds) refreshes automatically. **Cold data —
+Sackmann's historical matches — is refreshed manually**, and not often: it
+only changes the historical record, so letting it lag a few weeks barely
+moves inference (Elo / form / H2H use history up to the snapshot; the daily
+hot refresh keeps the upcoming-fixture window current). Refresh it when you
+feel like it, locally:
+
+```bash
+# 1. Pull the latest Sackmann data (git submodules under data/raw/).
+git -C data/raw/tennis_atp pull --ff-only && git -C data/raw/tennis_wta pull --ff-only
+
+# 2. Re-ingest cold layer + rebuild the inference state (Elo, form, features).
+#    --skip-market: the tennis-data.co.uk loader is CPU-bound and only feeds
+#    the calibration overlay, not production inference.
+uv run python scripts/refresh_data.py --skip-submodules --skip-market
+uv run python scripts/build_features.py
+# (optional) retrain — not needed weekly; models tolerate slightly older data.
+# uv run python scripts/train_models.py
+
+# 3. Publish the rebuilt DuckDB to the companion HF Dataset (the Space's
+#    source of truth — see scripts/hf_bootstrap.py).
+uv run hf upload Neuromediator/tennis-dashboard-data \
+    ./data/processed/tennis.duckdb processed/tennis.duckdb --repo-type dataset
+# If (and only if) you retrained in step 2, also re-publish the models. Upload
+# the symlink-dereferenced copy so the `latest/` dirs land as real files:
+#   cp -rL models models_hf_upload
+#   uv run hf upload Neuromediator/tennis-dashboard-data ./models_hf_upload models --repo-type dataset
+
+# 4. Force the Space to re-pull the fresh snapshot on a clean boot.
+uv run hf spaces restart Neuromediator/tennis-research-dashboard --factory-reboot
+```
+
+After the factory reboot the Space's ephemeral `/data` is empty, so
+`hf_bootstrap.py` downloads the updated snapshot; the keep-warm pinger
+re-warms it and the first visit pays the one-time ~1-3 min re-download.
+
 ## What's intentionally absent
 
 - No microservices, no message queue, no Redis, no managed Postgres.

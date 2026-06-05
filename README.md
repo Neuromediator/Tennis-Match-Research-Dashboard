@@ -56,7 +56,7 @@ The app ships as a **single Docker image** to a free **Hugging Face Space** (Doc
 - **Stays warm:** a twice-daily GitHub Actions ping (`.github/workflows/keepalive.yml`) keeps the Space from sleeping (free Spaces sleep after 48 h idle), so the in-memory DB + prediction cache persist for the uptime and visitors skip the cold-start re-download. An involuntary reset (HF rebuild/migration) is recovered by bootstrap + catch-up-on-wake (`maybe_catch_up_refresh` in `app/scheduler.py`).
 - **Cost defenses:** `st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table → `DAILY_LLM_BUDGET=60` traces/day. Past the cap, predictions still render without the news block.
 - **Secrets** (HF Space secrets): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret config via Space variables (`ENABLE_SCHEDULER`, `REFRESH_HOUR_UTC`, `HF_DATA_REPO`, …).
-- **Manual ops:** Sackmann cold refresh is operator-driven (rebuild the DuckDB locally, re-upload to the companion dataset). Hot fixtures and odds refresh automatically.
+- **Manual ops:** Sackmann cold refresh is operator-driven — rebuild the DuckDB locally and re-upload to the companion dataset, then factory-restart the Space. Step-by-step runbook in `docs/architecture.md` → *Manual cold-data refresh*. Hot fixtures and odds refresh automatically.
 
 Cost: **$0/month** (free CPU, no persistent storage). Tradeoff: writes don't survive an involuntary container reset — refresh data is re-fetched and the prediction cache re-computes on demand.
 
