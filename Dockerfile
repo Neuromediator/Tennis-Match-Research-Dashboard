@@ -3,13 +3,13 @@
 # Two-stage build for the tennis research dashboard.
 #
 # Builder: installs Python deps into a project venv via uv.
-# Runtime: slim image with only the venv + code. No data, no models —
-# those live on the Fly persistent volume at /data and are populated
-# during one-shot bootstrap via `fly ssh console` (see docs/phase7_plan.md).
+# Runtime: slim image with only the venv + code. No data, no models in the
+# image — on the live Hugging Face Space they are downloaded to /data on
+# container boot by scripts/hf_bootstrap.py (from a companion HF Dataset; see
+# docs/phases.md Phase 8). The entrypoint runs that bootstrap, then the CMD.
 #
-# The same image runs both Fly processes:
-#   - `app`  → streamlit (default CMD)
-#   - `cron` → `python scripts/refresh_hot.py` (override in fly.toml)
+# The same image is deployment-agnostic: it also ran on Fly.io (Phase 7),
+# where /data was a persistent volume instead of ephemeral container disk.
 
 # ---------------------------------------------------------------------------
 # Builder
@@ -62,13 +62,14 @@ COPY --from=builder /app/pyproject.toml /app/pyproject.toml
 
 RUN chmod +x /app/scripts/docker-entrypoint.sh
 
-# Persistent volume mount point (see fly.toml [mounts]).
-# DuckDB, Sackmann submodules, model artifacts all live here.
+# Data root. On HF this is the container's local (ephemeral) filesystem,
+# populated on boot by scripts/hf_bootstrap.py. DuckDB + model artifacts
+# live here. (On Fly it was a persistent volume mounted at the same path.)
 ENV DATA_DIR=/data \
     MODELS_DIR=/data/models
 
-# Streamlit runtime config — headless, bind to all interfaces, default
-# port 8080 (Fly's expected internal port).
+# Streamlit runtime config — headless, bind to all interfaces, port 8080.
+# HF routes to it via `app_port: 8080` in the README Space metadata.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     STREAMLIT_SERVER_PORT=8080 \
@@ -78,8 +79,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 EXPOSE 8080
 
-# Entrypoint bootstraps the persistent volume (no-op once populated / off
-# HF) then execs the CMD. CMD is the Streamlit app; it can be overridden
+# Entrypoint bootstraps /data (no-op once populated / when HF_DATA_REPO is
+# unset) then execs the CMD. CMD is the Streamlit app; it can be overridden
 # (e.g. `python scripts/refresh_hot.py`) and still runs through bootstrap.
 ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["streamlit", "run", "src/tennis_predictor/app/main.py"]

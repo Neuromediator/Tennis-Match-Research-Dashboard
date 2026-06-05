@@ -2,7 +2,7 @@
 
 A reference card for any Claude session working on this repo. Skim it, then start work; for deeper context follow the pointers at the bottom.
 
-**Live:** https://tennis-research-dashboard.fly.dev/ — Fly.io fra, single Machine (`shared-cpu-1x` / 2 GB), 5 GB volume at `/data`, daily refresh via in-process APScheduler at 21:00 UTC. Deployment shape and lessons in `docs/phases.md` Phase 7 + `docs/phase7_plan.md`.
+**Live:** https://neuromediator-tennis-research-dashboard.hf.space/ — free Hugging Face Space (Docker SDK, CPU basic, 2 vCPU / 16 GB RAM), **no persistent disk**: DuckDB + models are bootstrapped on container boot from the HF Dataset `Neuromediator/tennis-dashboard-data` (`scripts/hf_bootstrap.py`) onto the ephemeral local FS; a twice-daily GitHub Actions ping (`.github/workflows/keepalive.yml`) keeps it warm; daily refresh via in-process APScheduler at 21:00 UTC + catch-up-on-wake (`app/scheduler.py`). $0/month. Migration story in `docs/phases.md` Phase 8; prior Fly.io deployment in Phase 7 / `docs/phase7_plan.md`.
 
 ## What this project is
 

@@ -1,5 +1,12 @@
 # Phase 7 — Public deployment plan
 
+> **⚠️ Superseded (historical record).** The Fly.io deployment described here was
+> retired and the app moved to a free Hugging Face Space — see `docs/phases.md`
+> **Phase 8**. Kept for the deployment lessons (DuckDB single-writer constraint,
+> in-process APScheduler, three-layer cache, the cache-routing bug) which still
+> apply. The current live deployment, secrets, and ops are documented in
+> `docs/architecture.md` (Deployment shape) and `README.md`.
+
 Public deployment of the research dashboard to Fly.io. This document captured the design decisions agreed during planning and the concrete steps to execute them. **Phase 7 shipped 2026-05-29** — live at https://tennis-research-dashboard.fly.dev/. See the *Execution notes* section at the bottom for what changed between the plan and reality.
 
 ## Goals

@@ -192,3 +192,73 @@ Public deployment to **Fly.io**, single-Machine, single-DuckDB-file. Live at
 - Custom domain.
 
 See `docs/phase7_plan.md` for the full deployment decisions doc.
+
+> **Superseded by Phase 8.** The Fly.io deployment was retired in favour of a
+> free Hugging Face Space. This section is kept as historical record.
+
+---
+
+## Phase 8 — Migration to Hugging Face Spaces ✅
+
+Public deployment moved off Fly.io onto a **free Hugging Face Space**. Live at
+**https://neuromediator-tennis-research-dashboard.hf.space/**. Cost dropped from
+~$4/month to **$0**.
+
+**Why move:**
+- **Speed.** Fly's `shared-cpu-1x` / 2 GB OOM-swapped under load; cold-path
+  prediction reached ~4 min during contended hours. HF free CPU gives **16 GB
+  RAM** (no swap) → the working set stays page-cached and the cold path is back
+  to ~30-60 s.
+- **Cost.** Free CPU basic vs Fly's paid Machine + volume.
+
+**The storage saga (the hard part):**
+- HF has **retired the flat-rate persistent-storage tier** (the old
+  `request_space_storage(small)` API now 404s). The only durable read+write
+  storage left is **object-storage buckets**, which break DuckDB — the DB file
+  needs real file locking + random I/O + `fsync`/WAL semantics that an S3-FUSE
+  mount can't provide, and random reads of a 1.3 GB file over object storage
+  would be *slower* than the Fly disk we were leaving.
+- **Resolution: no persistent storage at all.** The DuckDB + model artifacts
+  live on the container's **local ephemeral filesystem** (a real, fast FS).
+  `scripts/hf_bootstrap.py` pulls the 1.3 GB snapshot from a companion HF
+  Dataset (`Neuromediator/tennis-dashboard-data`) on container boot. Writes
+  (daily refresh, `prediction_cache`, `llm_traces`) persist for the container's
+  uptime but not across an involuntary reset — acceptable for a research demo
+  where the dataset is the source of truth.
+
+**Keeping it usable at low traffic:**
+- Free Spaces sleep after 48 h idle; a cold start would re-download the 1.3 GB
+  snapshot (~1-3 min — bad for the first visitor). Fix: a **twice-daily GitHub
+  Actions ping** (`.github/workflows/keepalive.yml`) keeps the container warm,
+  so the in-memory DB + prediction cache persist and the 21:00 UTC APScheduler
+  refresh runs. (GitHub disables scheduled workflows after 60 days of repo
+  inactivity — the Space then simply sleeps again; no data loss.)
+- **`maybe_catch_up_refresh`** (`app/scheduler.py`): on app start, if hot data
+  is >24 h stale, schedule an immediate background refresh. This is what
+  recovers freshness after an involuntary reset, and what the original
+  "scheduler silently stopped" incident motivated.
+
+**Also shipped (carried over from the incident that triggered the migration):**
+- **Visible 429 signal.** matchstat's monthly quota (RapidAPI, resets on the
+  subscription billing cycle ~the 18th, *not* the calendar 1st) had silently
+  exhausted; the hot refresh failed on its first call every night for 3 days
+  and the UI showed only a generic "stale" banner. `widgets.is_quota_error` +
+  `query_last_hot_run_error` now surface "matchstat monthly quota exhausted
+  (429)" distinctly.
+
+**Built:**
+- `scripts/hf_bootstrap.py` + `scripts/docker-entrypoint.sh` (bootstrap-on-boot;
+  no-op when the volume is already populated or `HF_DATA_REPO` unset, so the
+  same image still runs anywhere).
+- HF Space front-matter in `README.md` (`sdk: docker`, `app_port: 8080`).
+- `.github/workflows/keepalive.yml` keep-warm pinger.
+- `app/scheduler.py` catch-up-on-wake + a process-wide refresh lock.
+
+**Open follow-ups:**
+- All Phase 7.1+ items still stand (automated Sackmann refresh, cold-data
+  freshness warning, basic-auth on Custom, custom domain).
+- If matchstat quota proves too tight (daily refresh ~450/mo of 500), move
+  per-prediction H2H / recent-form off live matchstat onto the local Sackmann
+  data so predictions cost zero quota.
+- Consider a smaller bootstrap DB (prune history not needed for inference) to
+  shrink the cold-start re-download after an involuntary reset.

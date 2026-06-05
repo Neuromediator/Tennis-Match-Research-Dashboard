@@ -17,9 +17,9 @@ pinned: false
 
 ## Live demo
 
-**[https://tennis-research-dashboard.fly.dev/](https://tennis-research-dashboard.fly.dev/)**
+**[https://neuromediator-tennis-research-dashboard.hf.space/](https://neuromediator-tennis-research-dashboard.hf.space/)**
 
-A single click on a fixture takes ~40 seconds the first time anyone in the world looks at it (LightGBM inference + LLM news lookup + Tavily searches) and is instant for the next 24 hours for anyone else (DuckDB-backed prediction cache). The dashboard runs on a single Fly.io Machine with daily APScheduler-driven fixture + odds refresh; no separate worker process. A global `DAILY_LLM_BUDGET` caps Anthropic spend at ≈ $1-2/day — past that limit predictions still render (model + market + surface-Elo) but the LLM news block shows a "paused until 00:00 UTC" message.
+A single click on a fixture takes ~30–60 seconds the first time anyone in the world looks at it (LightGBM inference + LLM news lookup + Tavily searches) and is instant afterwards (DuckDB-backed prediction cache). The dashboard runs on a single free Hugging Face Space (Docker, CPU basic) with an in-process daily fixture + odds refresh; no separate worker process. A global `DAILY_LLM_BUDGET` caps Anthropic spend at ≈ $1-2/day — past that limit predictions still render (model + market + surface-Elo) but the LLM news block shows a "paused until 00:00 UTC" message.
 
 
 ## Quick start
@@ -49,12 +49,15 @@ Env vars (in `.env`, template in `.env.example`): `ANTHROPIC_API_KEY`, `X_RAPIDA
 
 ## Deployment
 
-The app ships as a **single Docker image** to **Fly.io**, one Machine (`shared-cpu-1x` / 2 GB RAM), one 5 GB persistent volume mounted at `/data`. DuckDB lives on the volume; Sackmann submodules, model artefacts, and the prediction cache table sit alongside it. No microservices, no model server, no message queue.
+The app ships as a **single Docker image** to a free **Hugging Face Space** (Docker SDK, CPU basic — 2 vCPU / 16 GB RAM). No microservices, no model server, no message queue.
 
-- **Daily refresh** runs in-process via APScheduler (`src/tennis_predictor/app/scheduler.py`) — a background thread fires `CronTrigger(hour=21, minute=0, UTC)` and calls `refresh_hot.py` + `refresh_pre_match_odds.py` against a fresh DuckDB connection. No separate cron Machine: DuckDB does not support multi-process writes, so two Machines sharing one volume would deadlock the file lock.
-- **Cost defenses:** `st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table (24 h, cross-session) → `DAILY_LLM_BUDGET=60` traces/day. Past the cap, predictions still render without the news block.
-- **Secrets** (`fly secrets set`): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`.
-- **Bootstrap** is one-shot: see `docs/phase7_plan.md` for the `sleep infinity` CMD trick that lets you `fly ssh console` into the Machine without Streamlit grabbing the DuckDB file lock. Production `tennis.duckdb` and `models/` are built locally and uploaded via `fly ssh sftp put` because Fly's shared CPU is too slow for `build_features.py` / `train_models.py`.
-- **Manual ops:** weekly Sackmann cold refresh is operator-driven (`fly machine stop` → `git pull` submodules → `refresh_data.py --skip-submodules` → `fly machine start`). Hot fixtures and odds run automatically.
+- **Data on boot:** the Space has no persistent disk (HF retired the flat-rate storage tier; only object-storage buckets remain, which don't suit DuckDB's file locking + random I/O). Instead the 1.3 GB `tennis.duckdb` + model artefacts are pulled on container start from a companion HF Dataset (`Neuromediator/tennis-dashboard-data`) onto the container's local filesystem — a real FS, so DuckDB stays fast. See `scripts/hf_bootstrap.py`.
+- **Daily refresh** runs in-process via APScheduler (`src/tennis_predictor/app/scheduler.py`) — a background thread fires `CronTrigger(hour=21, minute=0, UTC)` and calls `refresh_hot` + odds refresh against a fresh DuckDB connection.
+- **Stays warm:** a twice-daily GitHub Actions ping (`.github/workflows/keepalive.yml`) keeps the Space from sleeping (free Spaces sleep after 48 h idle), so the in-memory DB + prediction cache persist for the uptime and visitors skip the cold-start re-download. An involuntary reset (HF rebuild/migration) is recovered by bootstrap + catch-up-on-wake (`maybe_catch_up_refresh` in `app/scheduler.py`).
+- **Cost defenses:** `st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table → `DAILY_LLM_BUDGET=60` traces/day. Past the cap, predictions still render without the news block.
+- **Secrets** (HF Space secrets): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret config via Space variables (`ENABLE_SCHEDULER`, `REFRESH_HOUR_UTC`, `HF_DATA_REPO`, …).
+- **Manual ops:** Sackmann cold refresh is operator-driven (rebuild the DuckDB locally, re-upload to the companion dataset). Hot fixtures and odds refresh automatically.
 
-Cost on Fly.io: ~$3-4/month (Machine + volume; bandwidth well under the 100 GB free tier).
+Cost: **$0/month** (free CPU, no persistent storage). Tradeoff: writes don't survive an involuntary container reset — refresh data is re-fetched and the prediction cache re-computes on demand.
+
+> Previously deployed on Fly.io (single Machine + 5 GB volume, ~$4/month); migrated to Hugging Face for more RAM (16 GB → no swap → faster cold path) at no cost. The Fly deployment notes are kept as history in `docs/phases.md` Phase 7 + `docs/phase7_plan.md`; the migration is Phase 8.
