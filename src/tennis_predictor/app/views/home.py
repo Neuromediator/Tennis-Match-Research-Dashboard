@@ -77,7 +77,7 @@ raw_rows = conn.execute(
 # `TournamentLevel` (Challengers, ITF, M15/W100, etc.). `infer_tournament_level`
 # also rescues active Slams whose tier got dropped from the matchstat
 # calendar (e.g., French Open after R1 starts) by falling back to a name match.
-rows = [r for r in raw_rows if infer_tournament_level(r[3], r[2]) is not None]
+rows = [r for r in raw_rows if infer_tournament_level(r[3], r[2], r[1]) is not None]
 
 if not rows:
     st.info(

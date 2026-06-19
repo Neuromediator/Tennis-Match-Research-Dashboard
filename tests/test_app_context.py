@@ -247,6 +247,25 @@ def test_infer_tournament_level_unknown_returns_none() -> None:
     assert infer_tournament_level(None, "ATP Cup") is None
 
 
+def test_infer_tournament_level_main_tour_defaults_by_tour() -> None:
+    # matchstat collapses every active non-Slam event's tier to "Main tour";
+    # with the tour known we default to the 500 tier so the event isn't dropped.
+    assert infer_tournament_level("Main tour", "Terra Wortmann Open - Halle", "ATP") == "ATP500"
+    assert infer_tournament_level("Main tour", "Berlin Tennis Open - Berlin", "WTA") == "WTA500"
+
+
+def test_infer_tournament_level_main_tour_without_tour_is_none() -> None:
+    # No tour → can't pick ATP500 vs WTA500, so it stays out-of-scope.
+    assert infer_tournament_level("Main tour", "Terra Wortmann Open - Halle") is None
+    assert infer_tournament_level("Main tour", "Some Event", "ITF") is None
+
+
+def test_infer_tournament_level_slam_name_beats_main_tour_tier() -> None:
+    # An active Slam can also arrive with tier="Main tour"; the name fallback
+    # must still win so it's a Slam (best-of-5 on the men's side), not ATP500.
+    assert infer_tournament_level("Main tour", "Wimbledon", "ATP") == "Slam"
+
+
 def test_load_context_from_freeform_tournament_name_passthrough() -> None:
     ctx = load_context_from_freeform(
         tour="WTA",

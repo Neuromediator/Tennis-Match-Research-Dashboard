@@ -62,17 +62,39 @@ _SLAM_NAME_PATTERNS: tuple[tuple[str, TournamentLevel], ...] = (
     ("us open", "Slam"),
 )
 
+# matchstat's coarse fixture-level tier. The forward-only calendar omits
+# in-progress tournaments, so `load_hot` falls back to the fixture's
+# `tournament.rank.name`, which is the literal "Main tour" for EVERY
+# ATP/WTA tour-level event (it does not distinguish 1000 / 500 / 250).
+_MAIN_TOUR_TIER = "Main tour"
+# Default level for a "Main tour" fixture, by tour. The 500 tier is the
+# typical headline event (Halle, Queen's, Berlin are 500s) and only
+# approximate for 250s/1000s. Used for the `tournament_level` feature; the
+# best-of default is 3 for every non-Slam tier regardless.
+_MAIN_TOUR_DEFAULT_LEVEL: dict[str, TournamentLevel] = {
+    "ATP": "ATP500",
+    "WTA": "WTA500",
+}
 
-def infer_tournament_level(tier: str | None, tournament_name: str | None) -> TournamentLevel | None:
+
+def infer_tournament_level(
+    tier: str | None,
+    tournament_name: str | None,
+    tour: str | None = None,
+) -> TournamentLevel | None:
     """Map a `scheduled_matches` row's (tier, name) to a model
     `TournamentLevel`, or None for out-of-scope events.
 
     Resolution order:
     1. Exact tier string lookup (the happy path — matchstat calendar
-       provides the tier).
+       provides the tier, e.g. "ATP 500").
     2. Slam-name fallback (Grand Slams currently in progress whose tier
-       was dropped from the calendar).
-    3. Otherwise unmatched → None.
+       was dropped from the forward-only calendar).
+    3. "Main tour" fallback, if `tour` is known: an active non-Slam event
+       whose tier collapsed to the coarse "Main tour" (see _MAIN_TOUR_TIER).
+       Without this, every grass/hard tour event (Halle, Queen's, Berlin)
+       is dropped and the dashboard shows "no matches".
+    4. Otherwise unmatched → None.
     """
     if tier and tier in _MATCHSTAT_TIER_TO_LEVEL:
         return _MATCHSTAT_TIER_TO_LEVEL[tier]
@@ -81,6 +103,8 @@ def infer_tournament_level(tier: str | None, tournament_name: str | None) -> Tou
         for needle, level in _SLAM_NAME_PATTERNS:
             if needle in lowered:
                 return level
+    if tier == _MAIN_TOUR_TIER and tour in _MAIN_TOUR_DEFAULT_LEVEL:
+        return _MAIN_TOUR_DEFAULT_LEVEL[tour]
     return None
 
 
@@ -136,7 +160,7 @@ def load_context_from_match_id(
             f"surface {surface!r} not in supported set {get_args(Surface)}; "
             "row may pre-date Phase-2 surface normalisation."
         )
-    level = infer_tournament_level(tier, tournament_name)
+    level = infer_tournament_level(tier, tournament_name, tour)
     if level is None:
         raise ContextBuildError(
             f"tournament_tier {tier!r} (tournament {tournament_name!r}) "
