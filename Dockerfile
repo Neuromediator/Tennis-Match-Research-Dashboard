@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Two-stage build for the tennis research dashboard.
 #
 # Builder: installs Python deps into a project venv via uv.
@@ -28,15 +26,13 @@ WORKDIR /app
 # Resolve and install deps first, without the project itself, so the
 # layer is cached unless pyproject.toml / uv.lock changes.
 COPY pyproject.toml uv.lock README.md ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
 
 # Now the project source.
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 # ---------------------------------------------------------------------------
 # Runtime
