@@ -1,6 +1,0 @@
-[submodule "data/raw/tennis_atp"]
-	path = data/raw/tennis_atp
-	url = https://github.com/JeffSackmann/tennis_atp.git
-[submodule "data/raw/tennis_wta"]
-	path = data/raw/tennis_wta
-	url = https://github.com/JeffSackmann/tennis_wta.git
