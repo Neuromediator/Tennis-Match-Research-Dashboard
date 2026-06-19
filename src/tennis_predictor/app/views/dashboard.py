@@ -91,7 +91,10 @@ for col, tour in zip(plot_cols, ("ATP", "WTA"), strict=True):
     with col:
         st.markdown(f"**{tour}**")
         if plot_path.exists():
-            st.image(str(plot_path), use_container_width=True)
+            # Fixed width (not container-width): a width-responsive image
+            # changes height with width, which with the page scrollbar forms
+            # the oscillation loop that shook the tables. Fixed size = stable.
+            st.image(str(plot_path), width=460)
             all_brier, last5_brier, n_folds = _calibration_metrics(tour)
             if all_brier is not None and last5_brier is not None:
                 st.caption(

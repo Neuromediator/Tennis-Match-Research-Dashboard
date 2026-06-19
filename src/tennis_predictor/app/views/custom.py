@@ -100,8 +100,19 @@ with st.expander("Advanced (tournament level / best of)"):
 
 
 def _resolve_full_name(canonical_id: str) -> str | None:
+    # Prefer the seeded `full_name` alias; fall back to "first last" when it
+    # is missing (some ranking-overlay player rows carry name_first/name_last
+    # but a NULL full_name, which previously failed resolution outright). The
+    # agent resolves the resulting name via AliasIndex downstream either way.
     row = conn.execute(
-        "SELECT full_name FROM players WHERE player_id = ?", [canonical_id]
+        """
+        SELECT COALESCE(
+                   NULLIF(TRIM(full_name), ''),
+                   NULLIF(TRIM(COALESCE(name_first, '') || ' ' || COALESCE(name_last, '')), '')
+               )
+        FROM players WHERE player_id = ?
+        """,
+        [canonical_id],
     ).fetchone()
     return row[0] if row and row[0] else None
 

@@ -37,6 +37,17 @@ st.set_page_config(
     layout="wide",
 )
 
+# Reserve the vertical scrollbar gutter so it never toggles. Without this,
+# a width-responsive element whose height changes with width (e.g. the
+# calibration-plot images on Model evaluation) creates a scrollbar↔width↔
+# height feedback loop that makes the page — and any wide table on it —
+# visibly oscillate ("shake"). Stable gutter breaks the loop.
+st.markdown(
+    "<style>html, body, [data-testid='stAppViewContainer'], "
+    "[data-testid='stMain'] { scrollbar-gutter: stable; }</style>",
+    unsafe_allow_html=True,
+)
+
 PAGES = [
     st.Page(
         "views/home.py",
