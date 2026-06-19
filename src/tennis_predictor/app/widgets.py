@@ -1083,7 +1083,10 @@ def recent_predictions_scoreboard(conn: duckdb.DuckDBPyConnection, *, limit: int
 
     st.dataframe(
         output_rows,
-        use_container_width=True,
+        width="stretch",
+        # Explicit height stops the auto-height ↔ container-width feedback
+        # loop that made the table visibly oscillate ("shake") on render.
+        height=520,
         hide_index=True,
         column_config={
             "ts": st.column_config.TextColumn("Time", width="small"),

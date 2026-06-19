@@ -128,7 +128,8 @@ if traces_df.empty:
 else:
     st.dataframe(
         traces_df,
-        use_container_width=True,
+        width="stretch",
+        height=520,
         hide_index=True,
         column_config={
             "trace_id": st.column_config.NumberColumn("ID", width="small"),
