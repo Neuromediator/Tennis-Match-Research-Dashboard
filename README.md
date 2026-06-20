@@ -52,7 +52,7 @@ Env vars (in `.env`, template in `.env.example`): `ANTHROPIC_API_KEY`, `X_RAPIDA
 The app ships as a **single Docker image** to a free **Hugging Face Space** (Docker SDK, CPU basic — 2 vCPU / 16 GB RAM). No microservices, no model server, no message queue.
 
 - **Data on boot:** the Space has no persistent disk (HF retired the flat-rate storage tier; only object-storage buckets remain, which don't suit DuckDB's file locking + random I/O). Instead the 1.3 GB `tennis.duckdb` + model artefacts are pulled on container start from a companion HF Dataset (`Neuromediator/tennis-dashboard-data`) onto the container's local filesystem — a real FS, so DuckDB stays fast. See `scripts/hf_bootstrap.py`.
-- **Daily refresh** runs in-process via APScheduler (`src/tennis_predictor/app/scheduler.py`) — a background thread fires `CronTrigger(hour=21, minute=0, UTC)` and calls `refresh_hot` + odds refresh against a fresh DuckDB connection.
+- **Daily refresh** runs in-process via APScheduler (`src/tennis_predictor/app/scheduler.py`) — a background thread fires `CronTrigger(hour=5, minute=0, UTC)` and calls `refresh_hot` + odds refresh against a fresh DuckDB connection.
 - **Stays warm:** a twice-daily GitHub Actions ping (`.github/workflows/keepalive.yml`) keeps the Space from sleeping (free Spaces sleep after 48 h idle), so the in-memory DB + prediction cache persist for the uptime and visitors skip the cold-start re-download. An involuntary reset (HF rebuild/migration) is recovered by bootstrap + catch-up-on-wake (`maybe_catch_up_refresh` in `app/scheduler.py`).
 - **Cost defenses:** `st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table → `DAILY_LLM_BUDGET=60` traces/day. Past the cap, predictions still render without the news block.
 - **Secrets** (HF Space secrets): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret config via Space variables (`ENABLE_SCHEDULER`, `REFRESH_HOUR_UTC`, `HF_DATA_REPO`, …).
@@ -60,4 +60,4 @@ The app ships as a **single Docker image** to a free **Hugging Face Space** (Doc
 
 Cost: **$0/month** (free CPU, no persistent storage). Tradeoff: writes don't survive an involuntary container reset — refresh data is re-fetched and the prediction cache re-computes on demand.
 
-> Previously deployed on Fly.io (single Machine + 5 GB volume, ~$4/month); migrated to Hugging Face for more RAM (16 GB → no swap → faster cold path) at no cost. The Fly deployment notes are kept as history in `docs/phases.md` Phase 7 + `docs/phase7_plan.md`; the migration is Phase 8.
+> Previously deployed on Fly.io (single Machine + 5 GB volume, ~$4/month); migrated to Hugging Face for more RAM (16 GB → no swap → faster cold path) at no cost. The Fly deployment notes are kept as history in `docs/phases.md` Phase 7; the migration is Phase 8.

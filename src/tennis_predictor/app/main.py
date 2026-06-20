@@ -110,7 +110,7 @@ def _footer() -> None:
 _scheduler = get_scheduler()
 
 # Catch-up-on-wake: on a host that sleeps when idle (HF Spaces), the
-# 21:00 cron cannot fire while asleep, so the first visit after a wake
+# 05:00 cron cannot fire while asleep, so the first visit after a wake
 # triggers a background refresh if the hot data is stale. Runs at most
 # once per process and never blocks the render. No-op when gated off.
 maybe_catch_up_refresh(_scheduler)

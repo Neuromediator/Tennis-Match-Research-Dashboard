@@ -32,18 +32,17 @@ except DuckDBLockError as exc:
     st.stop()
 stale_data_banner(conn)
 
-# Show "last refresh" age only — no manual trigger. The daily Fly.io
-# scheduled-machine job runs `scripts/refresh_hot.py` in the evening
-# UTC (set up during Phase 7 deploy). Letting users click a Refresh
-# button from the public URL exposes us to budget-draining click spam
-# against the 500/month matchstat free tier, so the path is removed
-# entirely.
+# Show "last refresh" age only — no manual trigger. The daily refresh
+# runs in-process via APScheduler at ~05:00 UTC (plus catch-up-on-wake;
+# see app/scheduler.py). Letting users click a Refresh button from the
+# public URL exposes us to budget-draining click spam against the
+# 500/month matchstat free tier, so the path is removed entirely.
 last_refresh = query_last_hot_refresh(conn)
 if last_refresh is not None:
     age = datetime.now(UTC) - last_refresh
     mins = int(age.total_seconds() // 60)
     age_label = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
-    st.caption(f"Last fixtures refresh: {age_label} ago (auto, daily evening UTC).")
+    st.caption(f"Last fixtures refresh: {age_label} ago (auto, daily ~05:00 UTC).")
 else:
     st.caption("No matchstat refresh on record yet.")
 

@@ -9,7 +9,7 @@ Gating:
 - `ENABLE_SCHEDULER=true` is required to actually start the scheduler.
   Local `streamlit run` leaves it off so devs don't accidentally hit
   matchstat / Odds API quotas. Production sets it via `fly secrets set`.
-- `REFRESH_HOUR_UTC` / `REFRESH_MINUTE_UTC` override the default 21:00 UTC.
+- `REFRESH_HOUR_UTC` / `REFRESH_MINUTE_UTC` override the default 05:00 UTC.
 
 Thread model:
 - APScheduler runs jobs in a worker thread pool (default size 10).
@@ -33,7 +33,7 @@ from tennis_predictor.data.refresh_jobs import run_daily_refreshes
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_HOUR_UTC: int = 21
+_DEFAULT_HOUR_UTC: int = 5  # 05:00 UTC — early-morning EU, low-traffic window
 _DEFAULT_MINUTE_UTC: int = 0
 _MISFIRE_GRACE_S: int = 3600  # 1h — catch a fire missed due to brief Machine restart
 

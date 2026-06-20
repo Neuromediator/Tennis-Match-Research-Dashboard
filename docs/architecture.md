@@ -127,10 +127,10 @@ scripts/
   - **Stays warm:** a twice-daily GitHub Actions ping (`.github/workflows/keepalive.yml`) keeps the Space from sleeping (free Spaces sleep after 48 h idle), so the in-memory DB + prediction cache persist across the uptime. An involuntary reset (HF rebuild/migration) wipes the ephemeral FS; bootstrap + catch-up-on-wake restore it.
   - Three-layer prediction cache: `st.session_state` (per-tab) → `@st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table (cross-session, persists for the container uptime). Repeat clicks on the same fixture cost $0.
   - Global daily LLM trace cap (`DAILY_LLM_BUDGET=60`) caps Anthropic spend at ≈ $1-2/day.
-  - Secrets via HF Space secrets: `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret env via Space variables: `ENABLE_SCHEDULER=true`, `REFRESH_HOUR_UTC=21`, `HF_DATA_REPO`, `MODELS_DIR=/data/models`.
+  - Secrets via HF Space secrets: `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret env via Space variables: `ENABLE_SCHEDULER=true`, `REFRESH_HOUR_UTC=5`, `HF_DATA_REPO`, `MODELS_DIR=/data/models`.
   - Bootstrap: `tennis.duckdb` and `models/` are built locally and uploaded to the companion HF Dataset; the Space pulls them on boot. Cost: **$0/month** (free CPU, no storage).
   - Cold (Sackmann) updates are **manual**: rebuild the DuckDB locally (`refresh_data.py` + `build_features.py` + `train_models.py`) and re-upload to the dataset. Daily/odds run automatically while warm.
-  - Prior Fly.io deployment (single Machine + volume) kept as history in `docs/phases.md` Phase 7 / `docs/phase7_plan.md`; the migration is Phase 8.
+  - Prior Fly.io deployment (single Machine + volume) kept as history in `docs/phases.md` Phase 7; the migration is Phase 8.
 
 ### Manual cold-data (Sackmann) refresh
 

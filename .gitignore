@@ -28,14 +28,17 @@ env/
 .env.local
 .env.*.local
 
-# Data — raw and processed live outside version control,
-# but Sackmann submodules under data/raw/ ARE tracked (as gitlinks).
+# Data — raw and processed live outside version control.
+# Sackmann data is NOT tracked as git submodules: the upstream repos
+# (github.com/JeffSackmann/tennis_atp · tennis_wta) now 404, and an
+# unreachable submodule remote breaks the HF Space build checkout
+# (job fails before Docker even runs). data/raw/ is populated locally
+# (clone the Sackmann mirrors there); production data comes from the
+# companion HF Dataset, not these dirs. See docs/phases.md Phase 8.
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
-!data/raw/tennis_atp
-!data/raw/tennis_wta
 
 # Model artifacts (root-level only — src/tennis_predictor/models/ is the Python package)
 /models/
@@ -66,3 +69,6 @@ notebooks/_*.ipynb
 # OS
 Thumbs.db
 models_hf_upload/
+
+# Internal deployment-history doc — kept locally, not published
+docs/phase7_plan.md

@@ -16,9 +16,11 @@ not abort the chain. The wrapper's own exit code is non-zero only if a
 daily step failed (weekly failures are noisy but don't gate the daily
 ones).
 
-Sackmann submodules live on the Fly volume at $DATA_DIR/raw/tennis_atp
-and $DATA_DIR/raw/tennis_wta. They're cloned during volume bootstrap
-(see docs/phase7_plan.md); this wrapper only pulls updates.
+Sackmann data lives at $DATA_DIR/raw/tennis_atp and
+$DATA_DIR/raw/tennis_wta; this wrapper only pulls updates. NOTE: the
+upstream Sackmann repos these were cloned from have been removed (see
+docs/phases.md Phase 8), so the cold-data pull steps no longer have a
+source — kept for local/offline use against an existing clone only.
 """
 
 from __future__ import annotations

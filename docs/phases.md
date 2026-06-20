@@ -191,8 +191,6 @@ Public deployment to **Fly.io**, single-Machine, single-DuckDB-file. Live at
 - Cloudflare in front for L7 protection.
 - Custom domain.
 
-See `docs/phase7_plan.md` for the full deployment decisions doc.
-
 > **Superseded by Phase 8.** The Fly.io deployment was retired in favour of a
 > free Hugging Face Space. This section is kept as historical record.
 
@@ -230,7 +228,7 @@ Public deployment moved off Fly.io onto a **free Hugging Face Space**. Live at
 - Free Spaces sleep after 48 h idle; a cold start would re-download the 1.3 GB
   snapshot (~1-3 min — bad for the first visitor). Fix: a **twice-daily GitHub
   Actions ping** (`.github/workflows/keepalive.yml`) keeps the container warm,
-  so the in-memory DB + prediction cache persist and the 21:00 UTC APScheduler
+  so the in-memory DB + prediction cache persist and the 05:00 UTC APScheduler
   refresh runs. (GitHub disables scheduled workflows after 60 days of repo
   inactivity — the Space then simply sleeps again; no data loss.)
 - **`maybe_catch_up_refresh`** (`app/scheduler.py`): on app start, if hot data
