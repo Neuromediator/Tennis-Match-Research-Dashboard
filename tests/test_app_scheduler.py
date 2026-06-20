@@ -9,7 +9,7 @@ job is scheduled — without starting a real APScheduler.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -21,9 +21,13 @@ from tennis_predictor.app import scheduler as sched_mod
 from tennis_predictor.data import schema
 
 
-def _make_db(tmp_path: Path, *, finished_at: datetime | None) -> Path:
+def _make_db(tmp_path: Path, *, finished_at: datetime | None, with_upcoming: bool = True) -> Path:
     """Create a DuckDB with the full schema and, optionally, one successful
-    matchstat ingestion_runs row finished at `finished_at` (naive)."""
+    matchstat ingestion_runs row finished at `finished_at` (naive).
+
+    When `with_upcoming` is True, also insert one scheduled fixture dated
+    tomorrow so the "no upcoming fixtures" catch-up trigger does not fire —
+    isolating the ingestion-age path under test."""
     db_path = tmp_path / "processed" / "tennis.duckdb"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(db_path))
@@ -36,6 +40,17 @@ def _make_db(tmp_path: Path, *, finished_at: datetime | None) -> Path:
             "requests_used, error_message, notes) "
             "VALUES ('r', 'matchstat', NULL, ?, ?, 'success', 0, 0, 0, 15, NULL, NULL)",
             [naive, naive],
+        )
+    if with_upcoming:
+        tomorrow = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1)
+        conn.execute(
+            "INSERT INTO scheduled_matches (scheduled_match_id, source, "
+            "fixture_external_id, tour, tournament_external_id, tournament_name, "
+            "surface, player1_external_id, player2_external_id, player1_name, "
+            "player2_name, scheduled_start_utc, time_confirmed, ingested_at) "
+            "VALUES ('m1', 'matchstat', 'f1', 'ATP', 't1', 'Terra Wortmann Open', "
+            "'Grass', 'p1', 'p2', 'A B', 'C D', ?, FALSE, ?)",
+            [tomorrow, tomorrow],
         )
     conn.close()
     return db_path
@@ -59,6 +74,22 @@ def test_noop_when_scheduler_is_none() -> None:
 def test_schedules_refresh_when_data_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Last successful refresh far in the past → unambiguously stale.
     db_path = _make_db(tmp_path, finished_at=datetime(2020, 1, 1, 0, 0, tzinfo=UTC))
+    monkeypatch.setattr(config, "DUCKDB_PATH", db_path)
+    scheduler = MagicMock()
+
+    sched_mod.maybe_catch_up_refresh(scheduler)
+
+    scheduler.add_job.assert_called_once()
+    assert scheduler.add_job.call_args.kwargs["id"] == "catch_up_refresh"
+
+
+def test_schedules_refresh_when_fresh_but_no_upcoming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ingestion is recent (fresh by age) but the snapshot has no upcoming
+    # fixtures — e.g. yesterday's fixtures have aged into the past. Home
+    # would be empty, so catch-up must still fire.
+    db_path = _make_db(tmp_path, finished_at=datetime.now(UTC), with_upcoming=False)
     monkeypatch.setattr(config, "DUCKDB_PATH", db_path)
     scheduler = MagicMock()
 

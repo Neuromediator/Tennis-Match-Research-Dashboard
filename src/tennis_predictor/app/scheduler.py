@@ -128,14 +128,24 @@ def get_scheduler() -> BackgroundScheduler | None:
 
 
 def _hot_data_is_stale() -> bool:
-    """Read-only check: is the most recent successful hot refresh older than
-    the staleness threshold (or missing entirely)?
+    """Read-only check: should we trigger a catch-up refresh?
+
+    True when EITHER:
+      - the most recent successful hot refresh is older than the staleness
+        threshold (or missing entirely), OR
+      - there are no upcoming fixtures in the home window (today .. +7d).
+
+    The second condition matters because freshness-by-ingestion-age and
+    freshness-by-content diverge: a snapshot ingested <24h ago is "fresh"
+    by age, but if its fixtures have all aged into the past (e.g. a Friday
+    snapshot restored on Saturday after the day's matches finished), the
+    home page is empty and we must refresh regardless of ingestion age.
 
     Opens a short-lived read-only DuckDB connection so it never contends
     with the Streamlit-owned write connection. Returns False (no catch-up)
     if the database file does not exist yet — e.g. a fresh host before the
     one-shot bootstrap has populated the volume."""
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
 
     import duckdb
 
@@ -151,9 +161,26 @@ def _hot_data_is_stale() -> bool:
         return False
     try:
         last = query_last_hot_refresh(conn)
+        today = datetime.now(UTC).date()
+        upcoming = conn.execute(
+            """
+            SELECT count(*) FROM scheduled_matches
+            WHERE scheduled_start_utc IS NULL
+               OR DATE(scheduled_start_utc) BETWEEN ? AND ?
+            """,
+            [today, today + timedelta(days=7)],
+        ).fetchone()
+    except Exception:
+        log.exception("[scheduler] catch-up content check failed")
+        return False
     finally:
         conn.close()
-    return is_data_stale(last, now=datetime.now(UTC))
+    if is_data_stale(last, now=datetime.now(UTC)):
+        return True
+    no_upcoming = not upcoming or upcoming[0] == 0
+    if no_upcoming:
+        log.info("[scheduler] no upcoming fixtures in window — catch-up needed")
+    return no_upcoming
 
 
 def maybe_catch_up_refresh(scheduler: BackgroundScheduler | None) -> None:
