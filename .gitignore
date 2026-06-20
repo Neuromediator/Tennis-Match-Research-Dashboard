@@ -72,3 +72,6 @@ models_hf_upload/
 
 # Internal deployment-history doc — kept locally, not published
 docs/phase7_plan.md
+
+# Personal LinkedIn post drafts — never publish
+docs/linkedin.md
