@@ -52,7 +52,7 @@ A single-process Python application with five logical layers and one DuckDB file
 
 | Source | Role | Refresh cadence | Quota |
 |---|---|---|---|
-| **Sackmann** (`tennis_atp` / `tennis_wta` git submodules) | Historical match record. Source of truth for `matches`, used to train the model and feed Elo state. | Weekly (git pull). | Free, no rate limit. |
+| **Sackmann** (was `tennis_atp` / `tennis_wta`) | Historical match record. Source of truth for `matches`, used to train the model and feed Elo state. | **Frozen** — the upstream GitHub repos were removed (now 404), so the cold layer is fixed at the last snapshot (~mid-2026) shipped in the HF Dataset. See note below. | Free, no rate limit (when it existed). |
 | **matchstat** (RapidAPI) | Upcoming fixtures, current rankings, on-demand H2H + per-player past matches for the prediction view. | Daily evening UTC + lazy per-prediction. | 500 req/month free — resets on the RapidAPI **subscription billing cycle**, not the calendar 1st. |
 | **The Odds API** | Pre-match h2h odds for active tour-level tournaments. Aggregated to median + Pinnacle subtitle. | Daily + lazy refresh on Prediction-page load when cache > 24h old. | 500 credits/calendar month free. |
 | **tennis-data.co.uk** | Historical closing-price implied probabilities. Calibration benchmark on training reports — not a feature. | Same orchestrator as Sackmann. | Free, manual download. |
@@ -129,46 +129,33 @@ scripts/
   - Global daily LLM trace cap (`DAILY_LLM_BUDGET=60`) caps Anthropic spend at ≈ $1-2/day.
   - Secrets via HF Space secrets: `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret env via Space variables: `ENABLE_SCHEDULER=true`, `REFRESH_HOUR_UTC=5`, `HF_DATA_REPO`, `MODELS_DIR=/data/models`.
   - Bootstrap: `tennis.duckdb` and `models/` are built locally and uploaded to the companion HF Dataset; the Space pulls them on boot. Cost: **$0/month** (free CPU, no storage).
-  - Cold (Sackmann) updates are **manual**: rebuild the DuckDB locally (`refresh_data.py` + `build_features.py` + `train_models.py`) and re-upload to the dataset. Daily/odds run automatically while warm.
+  - Cold (Sackmann) layer is **frozen** — the upstream repos were removed, so there is no routine cold refresh anymore (the historical record is fixed at the shipped snapshot). Hot fixtures/odds still refresh automatically while warm. See the note below.
   - Prior Fly.io deployment (single Machine + volume) kept as history in `docs/phases.md` Phase 7; the migration is Phase 8.
 
-### Manual cold-data (Sackmann) refresh
+### Cold data (Sackmann) is frozen — upstream removed
 
-Hot data (fixtures, rankings, odds) refreshes automatically. **Cold data —
-Sackmann's historical matches — is refreshed manually**, and not often: it
-only changes the historical record, so letting it lag a few weeks barely
-moves inference (Elo / form / H2H use history up to the snapshot; the daily
-hot refresh keeps the upcoming-fixture window current). Refresh it when you
-feel like it, locally:
+**The Sackmann source no longer exists.** The `JeffSackmann/tennis_atp` and
+`tennis_wta` GitHub repos that fed the cold layer were removed (the URLs now
+404; the author published a new, differently-structured point-by-point repo
+we don't use). Practical consequences:
 
-```bash
-# 1. Pull the latest Sackmann data (git submodules under data/raw/).
-git -C data/raw/tennis_atp pull --ff-only && git -C data/raw/tennis_wta pull --ff-only
-
-# 2. Re-ingest cold layer + rebuild the inference state (Elo, form, features).
-#    --skip-market: the tennis-data.co.uk loader is CPU-bound and only feeds
-#    the calibration overlay, not production inference.
-uv run python scripts/refresh_data.py --skip-submodules --skip-market
-uv run python scripts/build_features.py
-# (optional) retrain — not needed weekly; models tolerate slightly older data.
-# uv run python scripts/train_models.py
-
-# 3. Publish the rebuilt DuckDB to the companion HF Dataset (the Space's
-#    source of truth — see scripts/hf_bootstrap.py).
-uv run hf upload Neuromediator/tennis-dashboard-data \
-    ./data/processed/tennis.duckdb processed/tennis.duckdb --repo-type dataset
-# If (and only if) you retrained in step 2, also re-publish the models. Upload
-# the symlink-dereferenced copy so the `latest/` dirs land as real files:
-#   cp -rL models models_hf_upload
-#   uv run hf upload Neuromediator/tennis-dashboard-data ./models_hf_upload models --repo-type dataset
-
-# 4. Force the Space to re-pull the fresh snapshot on a clean boot.
-uv run hf spaces restart Neuromediator/tennis-research-dashboard --factory-reboot
-```
-
-After the factory reboot the Space's ephemeral `/data` is empty, so
-`hf_bootstrap.py` downloads the updated snapshot; the keep-warm pinger
-re-warms it and the first visit pays the one-time ~1-3 min re-download.
+- The historical match record (`matches`, and the Elo / form / H2H state
+  derived from it) is **frozen at the last snapshot** (~mid-2026), shipped in
+  the HF Dataset and loaded on boot by `scripts/hf_bootstrap.py`.
+- There is **no routine cold refresh** anymore — the old "`git -C
+  data/raw/... pull` → `refresh_data.py` → re-upload" runbook is dead because
+  the pull has no remote. (`git`-related steps in `scripts/refresh_all.py`
+  are kept only for an existing local clone.)
+- **No immediate impact**: the trained model artifacts and all existing
+  features are unaffected. Over a season, rankings/Elo for active players
+  gradually go stale (the matchstat *hot* layer still keeps the upcoming-
+  fixture window current — that path is unaffected). For a research demo this
+  is acceptable; a long-lived product would need a new historical source.
+- To rebuild/retrain you are limited to the existing snapshot (saved in the
+  dataset and locally), or you would have to adapt the new Sackmann schema —
+  out of scope. If you do rebuild from the local snapshot, re-upload the DB
+  (and, if retrained, the symlink-dereferenced `models/`) to the dataset and
+  `hf spaces restart --factory-reboot`.
 
 ## What's intentionally absent
 

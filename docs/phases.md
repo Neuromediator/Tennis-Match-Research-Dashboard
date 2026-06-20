@@ -250,13 +250,35 @@ Public deployment moved off Fly.io onto a **free Hugging Face Space**. Live at
   same image still runs anywhere).
 - HF Space front-matter in `README.md` (`sdk: docker`, `app_port: 8080`).
 - `.github/workflows/keepalive.yml` keep-warm pinger.
-- `app/scheduler.py` catch-up-on-wake + a process-wide refresh lock.
+- `app/scheduler.py` catch-up-on-wake + a process-wide refresh lock. The
+  catch-up fires when the hot data is stale by ingestion age **or** when the
+  snapshot has no upcoming fixtures in the home window (a recently-ingested
+  snapshot whose fixtures have aged into the past would otherwise show an
+  empty Home).
+
+**Build failure during the migration (resolved):** HF builds failed with
+`exit code 1` and *zero* Docker output, on every commit and even a freshly
+recreated Space, while the image built fine locally. Cause: the repo declared
+the Sackmann data as **git submodules**, and the upstream repos had been
+removed (404) — HF's submodule-aware checkout died before Docker ran. Fixed by
+de-submoduling (`git rm` the gitlinks + `.gitmodules`); the Space never needed
+them since data comes from the dataset.
+
+**Cold source removed (consequence):** the same removal froze the cold layer —
+see `docs/architecture.md` → *Cold data (Sackmann) is frozen*. No routine cold
+refresh exists anymore; the historical record is fixed at the shipped snapshot.
+
+**Daily refresh** runs at **05:00 UTC** (was 21:00) — a low-traffic window.
 
 **Open follow-ups:**
-- All Phase 7.1+ items still stand (automated Sackmann refresh, cold-data
-  freshness warning, basic-auth on Custom, custom domain).
+- Cold-data freshness warning, basic-auth on Custom, custom domain (from
+  Phase 7.1). The *automated Sackmann refresh* item is **dropped** — the
+  upstream source no longer exists.
 - If matchstat quota proves too tight (daily refresh ~450/mo of 500), move
-  per-prediction H2H / recent-form off live matchstat onto the local Sackmann
-  data so predictions cost zero quota.
+  per-prediction H2H / recent-form off live matchstat onto the **frozen local
+  Sackmann snapshot** so predictions cost zero quota (still viable — uses the
+  baked snapshot, not a live pull).
 - Consider a smaller bootstrap DB (prune history not needed for inference) to
   shrink the cold-start re-download after an involuntary reset.
+- A new historical-data source (adapt the new point-by-point Sackmann repo, or
+  another provider) if the project is ever revived as a living product.

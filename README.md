@@ -29,7 +29,12 @@ A single click on a fixture takes ~30–60 seconds the first time anyone in the 
 uv sync
 
 # Build everything from public data (~30 min cold start).
-uv run python scripts/refresh_data.py            # Sackmann historical
+# NOTE: the Sackmann repos that refresh_data.py cloned have been removed
+# upstream (now 404). The historical record ships as a frozen snapshot in
+# the companion HF Dataset (Neuromediator/tennis-dashboard-data); a clean
+# build from scratch is no longer possible without an existing local clone
+# or the new (differently-structured) Sackmann repo. See docs/architecture.md.
+uv run python scripts/refresh_data.py            # Sackmann historical (needs local clone)
 uv run python scripts/refresh_hot.py             # matchstat fixtures + rankings
 uv run python scripts/refresh_pre_match_odds.py  # The Odds API pre-match h2h
 uv run python scripts/build_features.py          # training_features + elo_state
@@ -56,7 +61,7 @@ The app ships as a **single Docker image** to a free **Hugging Face Space** (Doc
 - **Stays warm:** a twice-daily GitHub Actions ping (`.github/workflows/keepalive.yml`) keeps the Space from sleeping (free Spaces sleep after 48 h idle), so the in-memory DB + prediction cache persist for the uptime and visitors skip the cold-start re-download. An involuntary reset (HF rebuild/migration) is recovered by bootstrap + catch-up-on-wake (`maybe_catch_up_refresh` in `app/scheduler.py`).
 - **Cost defenses:** `st.cache_data(ttl=300)` (per-process) → `prediction_cache` DuckDB table → `DAILY_LLM_BUDGET=60` traces/day. Past the cap, predictions still render without the news block.
 - **Secrets** (HF Space secrets): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `X_RAPIDAPI_KEY`, `THE_ODDS_API_KEY`. Non-secret config via Space variables (`ENABLE_SCHEDULER`, `REFRESH_HOUR_UTC`, `HF_DATA_REPO`, …).
-- **Manual ops:** Sackmann cold refresh is operator-driven — rebuild the DuckDB locally and re-upload to the companion dataset, then factory-restart the Space. Step-by-step runbook in `docs/architecture.md` → *Manual cold-data refresh*. Hot fixtures and odds refresh automatically.
+- **Manual ops:** the Sackmann cold layer is **frozen** — the upstream repos were removed (now 404), so the historical record is fixed at the shipped snapshot and there is no routine cold refresh. Hot fixtures and odds still refresh automatically. Details in `docs/architecture.md` → *Cold data (Sackmann) is frozen*.
 
 Cost: **$0/month** (free CPU, no persistent storage). Tradeoff: writes don't survive an involuntary container reset — refresh data is re-fetched and the prediction cache re-computes on demand.
 
