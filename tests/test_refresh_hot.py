@@ -853,3 +853,81 @@ def test_refresh_hot_prunes_round_contradicted_fixture(
         "SELECT scheduled_match_id, round_name FROM scheduled_matches ORDER BY scheduled_match_id"
     ).fetchall()
     assert surviving == [("matchstat::1313", "Second")]
+
+
+def _q_fixture(
+    fx_id: int,
+    p1_id: int,
+    p1_name: str,
+    p2_id: int,
+    p2_name: str,
+    *,
+    round_name: str = "Q1",
+    round_id: int = -3,
+    tournament_id: int = 21347,
+) -> dict[str, Any]:
+    """A qualifying fixture at a Masters event (Cincinnati 2026 shape)."""
+    return {
+        "id": fx_id,
+        "date": f"{TODAY.isoformat()}T15:00:00.000Z",
+        "roundId": round_id,
+        "player1Id": p1_id,
+        "player2Id": p2_id,
+        "tournamentId": tournament_id,
+        "player1": {"id": p1_id, "name": p1_name, "countryAcr": "USA"},
+        "player2": {"id": p2_id, "name": p2_name, "countryAcr": "POR"},
+        "tournament": {
+            "id": tournament_id,
+            "name": "Cincinnati Open - Cincinnati",
+            "court": {"name": "Hard"},
+            "rank": {"id": 3, "name": "Masters series"},
+        },
+        "round": {"id": round_id, "name": round_name},
+    }
+
+
+def test_refresh_hot_keeps_qualifying_fixtures(db: duckdb.DuckDBPyConnection) -> None:
+    """Qualifying-only tournaments must survive the contradiction prune.
+
+    Regression for the second half of the 2026-08-11 outage: `_ROUND_RANK`
+    gives Q1/Q2/Q3 negative ranks while the prune used 0 for "no round
+    info". A Q1 row (-3) therefore never entered the per-player index
+    (`-3 > 0` is false) and was then deleted by the `0 > -3` comparison —
+    silently wiping every qualifying fixture on every refresh. Cincinnati
+    2026 was in its qualifying phase and vanished from the dashboard
+    minutes after each refresh wrote it.
+    """
+    q1_a = _q_fixture(1375, 5001, "Marcos Giron", 5002, "Henrique Rocha")
+    q1_b = _q_fixture(1378, 5003, "Aleksandar Vukic", 5004, "Darwin Blanch")
+
+    client = FakeMatchstatClient()
+    client.set_fixtures("atp", TODAY, {"data": [q1_a], "hasNextPage": False})
+    client.set_tournament_fixtures("atp", 21347, {"data": [q1_a, q1_b], "hasNextPage": False})
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    surviving = db.execute(
+        "SELECT scheduled_match_id, round_name FROM scheduled_matches ORDER BY scheduled_match_id"
+    ).fetchall()
+    assert surviving == [("matchstat::1375", "Q1"), ("matchstat::1378", "Q1")]
+
+
+def test_refresh_hot_prunes_qualifying_round_contradicted_by_later_round(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """The heuristic still applies within qualifying: a player who has a
+    published Q2 fixture has already won their Q1, so the lingering Q1
+    row is stale. Guards against "fix the sentinel by never pruning Q"."""
+    q1_done = _q_fixture(1375, 5001, "Marcos Giron", 5002, "Henrique Rocha")
+    q2 = _q_fixture(1400, 5001, "Marcos Giron", 5005, "Mark Lajal", round_name="Q2", round_id=-2)
+
+    client = FakeMatchstatClient()
+    client.set_fixtures("atp", TODAY, {"data": [q1_done], "hasNextPage": False})
+    client.set_tournament_fixtures("atp", 21347, {"data": [q1_done, q2], "hasNextPage": False})
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    surviving = db.execute(
+        "SELECT scheduled_match_id, round_name FROM scheduled_matches ORDER BY scheduled_match_id"
+    ).fetchall()
+    assert surviving == [("matchstat::1400", "Q2")]

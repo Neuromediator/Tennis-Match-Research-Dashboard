@@ -472,8 +472,12 @@ def _prune_stale_scheduled_matches(
 
 
 # matchstat round labels we've observed, mapped to a monotonic rank used
-# by the contradiction-prune below. Unknown labels rank as 0 → skipped
-# defensively (no row deleted via a comparison we can't make sense of).
+# by the contradiction-prune below. Labels absent from this map are
+# skipped defensively (no row deleted via a comparison we can't make
+# sense of) — the prune tests membership, never a magic sentinel value:
+# qualifying ranks are negative, so 0 is a legal-looking rank and using
+# it as "unknown" silently deleted every Q1/Q2/Q3 fixture (see
+# `_prune_contradicted_round_fixtures`).
 _ROUND_RANK: dict[str, int] = {
     "Q1": -3,
     "Q2": -2,
@@ -529,6 +533,15 @@ def _prune_contradicted_round_fixtures(
     - Skipped for rows whose `round_name` is not in `_ROUND_RANK` (we
       don't want to delete a row whose round we can't classify).
     - Only deletes within the tours queried this run.
+
+    "Round rank not known" is represented by `None` throughout, never by
+    0. The earlier version used 0 for both "label not in `_ROUND_RANK`"
+    and "player not seen yet", which collided with the negative
+    qualifying ranks: a Q1 fixture (-3) never made it into the index
+    (`-3 > 0` is false) and was then deleted by the `0 > -3` check. Every
+    qualifying fixture was wiped on every refresh, so a tournament in its
+    qualifying phase rendered as "nothing scheduled" (observed live on
+    Cincinnati 2026, 24 ATP + WTA Q1 fixtures deleted per run).
     """
     if not tours:
         return 0
@@ -549,26 +562,26 @@ def _prune_contradicted_round_fixtures(
     by_tournament: dict[tuple[str, str], dict[str, int]] = {}
     rows_by_id: dict[str, tuple[str, int, str, str, str, str]] = {}
     for sm_id, round_name, p1, p2, t_id, tour in rows:
-        rank = _ROUND_RANK.get(round_name or "", 0)
-        if rank == 0:
+        rank = _ROUND_RANK.get(round_name or "")
+        if rank is None:
             continue
         key = (tour, t_id)
         bucket = by_tournament.setdefault(key, {})
         for p in (p1, p2):
             if p is None:
                 continue
-            prior = bucket.get(p, 0)
-            if rank > prior:
+            prior = bucket.get(p)
+            if prior is None or rank > prior:
                 bucket[p] = rank
         rows_by_id[sm_id] = (round_name, rank, p1, p2, t_id, tour)
 
     stale_ids: list[str] = []
     for sm_id, (_, rank, p1, p2, t_id, tour) in rows_by_id.items():
         bucket = by_tournament.get((tour, t_id), {})
-        max_p1 = bucket.get(p1, 0) if p1 else 0
-        max_p2 = bucket.get(p2, 0) if p2 else 0
+        max_p1 = bucket.get(p1) if p1 else None
+        max_p2 = bucket.get(p2) if p2 else None
         # Either player already in a strictly later round → this row is stale.
-        if max_p1 > rank or max_p2 > rank:
+        if (max_p1 is not None and max_p1 > rank) or (max_p2 is not None and max_p2 > rank):
             stale_ids.append(sm_id)
 
     if not stale_ids:
