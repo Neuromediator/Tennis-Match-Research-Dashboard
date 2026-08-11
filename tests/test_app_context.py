@@ -254,6 +254,15 @@ def test_infer_tournament_level_main_tour_defaults_by_tour() -> None:
     assert infer_tournament_level("Main tour", "Berlin Tennis Open - Berlin", "WTA") == "WTA500"
 
 
+def test_infer_tournament_level_masters_series_rank_tag() -> None:
+    # "Masters series" is matchstat's fixture-level rank tag for ATP/WTA
+    # 1000 events. It lands in `tournament_tier` whenever the forward-only
+    # calendar has already dropped the in-progress event, so it must map
+    # to M1000 rather than being filtered out of the Home page.
+    assert infer_tournament_level("Masters series", "National Bank Open - Montreal") == "M1000"
+    assert infer_tournament_level("Masters series", "Cincinnati Open", "WTA") == "M1000"
+
+
 def test_infer_tournament_level_main_tour_without_tour_is_none() -> None:
     # No tour → can't pick ATP500 vs WTA500, so it stays out-of-scope.
     assert infer_tournament_level("Main tour", "Terra Wortmann Open - Halle") is None

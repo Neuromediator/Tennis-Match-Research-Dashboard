@@ -306,10 +306,24 @@ def _refresh_fixtures_for_date(
 
 
 # Tour-level tournament-rank tags as matchstat returns them on the
-# fixture payload's `tournament.rank.name`. Used by the discovery step
-# to filter out Challengers, ITFs, etc. without needing the calendar
-# (which is forward-only and silently drops active tournaments).
-_TOUR_LEVEL_RANK_NAMES: frozenset[str] = frozenset({"Grand Slam", "Main tour"})
+# fixture payload's `tournament.rank.name`, case-folded. Used by the
+# discovery step to filter out Challengers, ITFs, etc. without needing
+# the calendar (which is forward-only and silently drops active
+# tournaments).
+#
+# Observed values (live probes):
+#   "Grand Slam"                          — the four Slams
+#   "Main tour"                           — ATP/WTA 250 & 500 events
+#   "Masters series"                      — ATP/WTA 1000 events
+#   "Challengers/ITF tournaments > $10K"  — excluded
+#   null                                  — M15/W15/... futures, excluded
+#
+# "Masters series" was missing until 2026-08-11: no refresh had ever run
+# during a Masters week (Phase 6.2 was built during Roland Garros and
+# tested on the grass 500s), so the whole Canada/Cincinnati swing
+# discovered zero active tournaments and the dashboard showed
+# "No matches scheduled in the next 7 days".
+_TOUR_LEVEL_RANK_NAMES: frozenset[str] = frozenset({"grand slam", "main tour", "masters series"})
 
 
 def _discover_active_tournament_ids(
@@ -318,20 +332,35 @@ def _discover_active_tournament_ids(
     today: date,
     *,
     lookahead_days: int = 1,
+    calendar_tournament_ids: set[int] | None = None,
 ) -> set[int]:
     """Return the set of tour-level tournament IDs that matchstat
     currently lists fixtures for.
 
     Walks `/fixtures/{today}` (and an optional 1-day lookahead) once
-    per tour, collects distinct `tournament_id` values whose
-    `tournament.rank.name` is in `_TOUR_LEVEL_RANK_NAMES`. Cheap
-    (1-2 API calls per tour) and authoritative: matchstat lists a
+    per tour and collects distinct `tournament_id` values that pass
+    *either* of two independent tour-level tests:
+
+    1. `tournament_id` is in `calendar_tournament_ids` — the caller's
+       calendar-derived lookup, already filtered to `TOUR_LEVEL_TIERS`
+       ("ATP Masters 1000", "WTA 500", ...). This is the precise
+       signal, but the calendar is forward-only, so an event that has
+       already started may be missing from it.
+    2. `tournament.rank.name` is in `_TOUR_LEVEL_RANK_NAMES` — the
+       coarse per-fixture tag, which survives the calendar gap.
+
+    Two sources rather than one because either can silently go blind:
+    the calendar drops in-progress events, and the rank-name vocabulary
+    is undocumented and has already surprised us once ("Masters series").
+
+    Cheap (1-2 API calls per tour) and authoritative: matchstat lists a
     tournament under `/fixtures/{date}` if and only if there's at
     least one fixture scheduled for that date — which is exactly when
     we want to pull its full draw.
 
     Lookahead = 1 covers the case where today has no main-tour matches
     yet (e.g., before Day 1 of a Slam) but tomorrow does."""
+    calendar_ids = calendar_tournament_ids or set()
     active: set[int] = set()
     for offset in range(lookahead_days + 1):
         d = today + timedelta(days=offset)
@@ -339,10 +368,13 @@ def _discover_active_tournament_ids(
         while True:
             page = client.fixtures_for_date(tour_code, d, page_no=page_no)
             for fx in page.data:
+                if fx.tournament_id in calendar_ids:
+                    active.add(fx.tournament_id)
+                    continue
                 if fx.tournament is None:
                     continue
                 rank_name = fx.tournament.rank.name if fx.tournament.rank else None
-                if rank_name in _TOUR_LEVEL_RANK_NAMES:
+                if rank_name and rank_name.strip().casefold() in _TOUR_LEVEL_RANK_NAMES:
                     active.add(fx.tournament_id)
             if not page.has_next_page:
                 break
@@ -806,7 +838,11 @@ def refresh_hot(
             # so Slam R1 fixtures whose day-of-play hasn't been
             # announced yet still appear (only their time is TBD).
             active_tournament_ids = _discover_active_tournament_ids(
-                client, tour_code, today, lookahead_days=1
+                client,
+                tour_code,
+                today,
+                lookahead_days=1,
+                calendar_tournament_ids=set(tier_by_id),
             )
             for tid in sorted(active_tournament_ids):
                 _refresh_fixtures_for_tournament(

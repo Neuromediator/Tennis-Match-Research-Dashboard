@@ -47,6 +47,12 @@ _MATCHSTAT_TIER_TO_LEVEL: dict[str, TournamentLevel] = {
     "WTA 500": "WTA500",
     "WTA 250": "WTA250",
     "Finals": "Finals",
+    # Not a calendar tier but a fixture `tournament.rank.name`: when the
+    # forward-only calendar has already dropped an in-progress event,
+    # `load_hot` stores the coarse rank tag instead. "Masters series" is
+    # matchstat's tag for every ATP/WTA 1000 (Canada, Cincinnati, Indian
+    # Wells, ...) — see `_TOUR_LEVEL_RANK_NAMES` in data/refresh_hot.py.
+    "Masters series": "M1000",
 }
 
 # Tournament-name fallback for the matchstat-calendar gap: per Phase 2

@@ -352,6 +352,84 @@ def test_refresh_hot_paginates_fixtures(db: duckdb.DuckDBPyConnection) -> None:
     assert count is not None and count[0] == 2
 
 
+def test_discovery_accepts_masters_series_rank(db: duckdb.DuckDBPyConnection) -> None:
+    """A "Masters series" fixture is tour-level and must be discovered.
+
+    Regression for the 2026-08-11 outage: matchstat tags ATP/WTA 1000
+    events (Canada, Cincinnati, Indian Wells, ...) with
+    `tournament.rank.name = "Masters series"`, which was absent from the
+    discovery whitelist. Discovery returned an empty set for both tours,
+    no `/fixtures/tournament/{id}` call was made, `scheduled_matches`
+    stayed empty and the dashboard read "No matches scheduled in the
+    next 7 days" for the whole Masters swing.
+
+    The calendar is deliberately left empty here so the rank-name path
+    is the only thing that can rescue the fixture.
+    """
+    masters_id = 21346
+    masters_fixture = _fixture(tournament_id=masters_id)
+    masters_fixture["tournament"]["name"] = "National Bank Open - Montreal"
+    masters_fixture["tournament"]["rank"] = {"id": 3, "name": "Masters series"}
+
+    client = FakeMatchstatClient()
+    client.set_fixtures("atp", TODAY, {"data": [masters_fixture], "hasNextPage": False})
+    client.set_tournament_fixtures(
+        "atp", masters_id, {"data": [masters_fixture], "hasNextPage": False}
+    )
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    row = db.execute(
+        "SELECT tournament_external_id, tournament_tier FROM scheduled_matches"
+    ).fetchone()
+    # Calendar had no entry, so the tier falls back to the rank tag —
+    # `app.context.infer_tournament_level` maps it to M1000.
+    assert row == (str(masters_id), "Masters series")
+
+
+def test_discovery_accepts_calendar_listed_tournament_with_unknown_rank(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Second discovery signal: a tour-level tier in the calendar is
+    enough even when the fixture's rank tag is one we've never seen.
+
+    Keeps the refresh alive if matchstat renames its rank vocabulary
+    again (it is undocumented and already changed under us once)."""
+    fixture = _fixture()
+    fixture["tournament"]["rank"] = {"id": 99, "name": "Some Brand New Tag"}
+
+    client = FakeMatchstatClient()
+    client.set_calendar("atp", TODAY.year, [_calendar_tour_level_atp250()])
+    client.set_fixtures("atp", TODAY, {"data": [fixture], "hasNextPage": False})
+    client.set_tournament_fixtures("atp", 21327, {"data": [fixture], "hasNextPage": False})
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    count = db.execute("SELECT COUNT(*) FROM scheduled_matches").fetchone()
+    assert count is not None and count[0] == 1
+
+
+def test_discovery_skips_challenger_and_itf_fixtures(db: duckdb.DuckDBPyConnection) -> None:
+    """Challenger / ITF rank tags stay out: neither signal matches, so no
+    per-tournament fetch happens and nothing is written."""
+    challenger = _fixture(fx_id=9001, tournament_id=21927)
+    challenger["tournament"]["name"] = "Brownsburg Challenger"
+    challenger["tournament"]["rank"] = {"id": 5, "name": "Challengers/ITF tournaments > $10K"}
+    futures = _fixture(fx_id=9002, tournament_id=21959)
+    futures["tournament"]["name"] = "M25 Muttenz"
+    futures["tournament"]["rank"] = None
+
+    client = FakeMatchstatClient()
+    client.set_fixtures("atp", TODAY, {"data": [challenger, futures], "hasNextPage": False})
+
+    refresh_hot(db, client, tours=["ATP"], today=TODAY)
+
+    count = db.execute("SELECT COUNT(*) FROM scheduled_matches").fetchone()
+    assert count is not None and count[0] == 0
+    # 1 calendar + 2 discovery probes + 1 rankings, and no per-tournament call.
+    assert client.requests_used == 4
+
+
 def test_refresh_hot_promotes_completed_fixtures(db: duckdb.DuckDBPyConnection) -> None:
     """promote_completed_fixtures is still invoked at end-of-run.
 
