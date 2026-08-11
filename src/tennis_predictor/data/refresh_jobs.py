@@ -69,10 +69,20 @@ def _run_hot(conn: duckdb.DuckDBPyConnection) -> tuple[bool, str | None]:
                 tours=["ATP", "WTA"],
                 review_csv_path=config.PROCESSED_DIR / "aliases_review_matchstat.csv",
             )
+        # `fixtures` is logged per-tour because it is the one number that
+        # tells "the refresh worked" from "the refresh ran and found
+        # nothing". The 2026-08 Masters outage looked perfectly healthy in
+        # the logs (status=partial, requests=9, HTTP 200 everywhere) while
+        # zero fixtures were written; a fixtures=0 line makes it obvious.
+        fixture_counts = " ".join(
+            f"{tour}:{s.fixtures.added}+{s.fixtures.skipped}~{s.fixtures.failed}!"
+            for tour, s in summary.per_tour.items()
+        )
         log.info(
-            "[refresh_jobs] hot done: status=%s requests=%d",
+            "[refresh_jobs] hot done: status=%s requests=%d fixtures(added+skipped~failed!)=[%s]",
             summary.status,
             summary.requests_used,
+            fixture_counts,
         )
         if summary.status == "failed":
             return False, f"refresh_hot failed: {summary.error_message or 'unknown'}"
